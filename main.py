@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
@@ -540,3 +540,222 @@ async def delete_user(user_id: str, user=Depends(get_current_user)):
         return {"message": "User deleted successfully"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+    
+
+
+    # Add these routes to the END of your main.py file
+import hmac
+import hashlib
+import json
+
+# ══════════════════════════════
+# PAYSTACK PAYMENT ROUTES
+# ══════════════════════════════
+
+PLANS = {
+    "personal": {
+        "name": "Personal",
+        "amount_ngn": 650000,   # ₦6,500 in kobo
+        "amount_usd": 400,      # $4 in cents
+        "daily_limit": 1500,
+        "contacts_limit": 20000,
+        "smtp_limit": 3,
+        "scraper_limit": 400,
+        "campaigns_limit": 10,
+        "ai_personalization": True,
+        "auto_followup": False
+    },
+    "corporate": {
+        "name": "Corporate",
+        "amount_ngn": 2400000,  # ₦24,000 in kobo
+        "amount_usd": 1500,     # $15 in cents
+        "daily_limit": 5000,
+        "contacts_limit": 100000,
+        "smtp_limit": 7,
+        "scraper_limit": 2000,
+        "campaigns_limit": 40,
+        "ai_personalization": True,
+        "auto_followup": True
+    }
+}
+
+class InitiatePaymentModel(BaseModel):
+    plan: str
+    currency: str = "NGN"  # NGN or USD
+
+@app.post("/payments/initiate")
+async def initiate_payment(data: InitiatePaymentModel, user=Depends(get_current_user)):
+    if data.plan not in PLANS:
+        raise HTTPException(status_code=400, detail="Invalid plan. Choose 'personal' or 'corporate'")
+
+    if data.currency not in ["NGN", "USD"]:
+        raise HTTPException(status_code=400, detail="Invalid currency. Choose 'NGN' or 'USD'")
+
+    plan = PLANS[data.plan]
+    amount = plan["amount_ngn"] if data.currency == "NGN" else plan["amount_usd"]
+
+    secret_key = os.getenv("PAYSTACK_SECRET_KEY")
+
+    try:
+        async with httpx.AsyncClient() as client:
+            res = await client.post(
+                "https://api.paystack.co/transaction/initialize",
+                headers={
+                    "Authorization": f"Bearer {secret_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "email": user.email,
+                    "amount": amount,
+                    "currency": data.currency,
+                    "metadata": {
+                        "user_id": user.id,
+                        "plan": data.plan,
+                        "currency": data.currency
+                    },
+                    "callback_url": f"{os.getenv('FRONTEND_URL', 'darling-moonbeam-cca341.netlify.app')}/payment-success"
+                }
+            )
+
+        result = res.json()
+        if result.get("status"):
+            return {
+                "payment_url": result["data"]["authorization_url"],
+                "reference": result["data"]["reference"],
+                "plan": data.plan,
+                "amount": amount,
+                "currency": data.currency
+            }
+        raise HTTPException(status_code=400, detail="Payment initiation failed")
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/payments/verify/{reference}")
+async def verify_payment(reference: str, user=Depends(get_current_user)):
+    secret_key = os.getenv("PAYSTACK_SECRET_KEY")
+
+    try:
+        async with httpx.AsyncClient() as client:
+            res = await client.get(
+                f"https://api.paystack.co/transaction/verify/{reference}",
+                headers={"Authorization": f"Bearer {secret_key}"}
+            )
+
+        result = res.json()
+
+        if result.get("status") and result["data"]["status"] == "success":
+            metadata = result["data"].get("metadata", {})
+            plan = metadata.get("plan")
+
+            if plan in PLANS:
+                plan_data = PLANS[plan]
+
+                # Update user plan in database
+                supabase_admin.table("users").update({
+                    "plan": plan,
+                    "daily_limit": plan_data["daily_limit"],
+                    "plan_expires_at": "now() + interval '30 days'"
+                }).eq("id", user.id).execute()
+
+                # Log the payment
+                supabase_admin.table("payments").insert({
+                    "user_id": user.id,
+                    "plan": plan,
+                    "amount": result["data"]["amount"],
+                    "currency": result["data"]["currency"],
+                    "reference": reference,
+                    "status": "success"
+                }).execute()
+
+                return {
+                    "message": f"Payment successful! {plan_data['name']} plan activated.",
+                    "plan": plan,
+                    "daily_limit": plan_data["daily_limit"]
+                }
+
+        raise HTTPException(status_code=400, detail="Payment verification failed")
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/payments/webhook")
+async def paystack_webhook(request: Request):
+    secret_key = os.getenv("PAYSTACK_SECRET_KEY")
+    body = await request.body()
+
+    # Verify webhook signature
+    signature = request.headers.get("x-paystack-signature", "")
+    expected = hmac.new(
+        secret_key.encode(),
+        body,
+        hashlib.sha512
+    ).hexdigest()
+
+    if signature != expected:
+        raise HTTPException(status_code=400, detail="Invalid signature")
+
+    event = json.loads(body)
+
+    if event.get("event") == "charge.success":
+        data = event["data"]
+        metadata = data.get("metadata", {})
+        user_id = metadata.get("user_id")
+        plan = metadata.get("plan")
+
+        if user_id and plan and plan in PLANS:
+            plan_data = PLANS[plan]
+            supabase_admin.table("users").update({
+                "plan": plan,
+                "daily_limit": plan_data["daily_limit"],
+                "plan_expires_at": "now() + interval '30 days'"
+            }).eq("id", user_id).execute()
+
+    return {"status": "ok"}
+
+
+@app.get("/payments/plans")
+async def get_plans():
+    return {
+        "free": {
+            "name": "Free",
+            "price_ngn": 0,
+            "price_usd": 0,
+            "daily_limit": 100,
+            "contacts_limit": 500,
+            "smtp_limit": 1,
+            "scraper_limit": 10,
+            "campaigns_limit": 1,
+            "ai_personalization": False,
+            "auto_followup": False,
+            "ads": True
+        },
+        "personal": {
+            "name": "Personal",
+            "price_ngn": 6500,
+            "price_usd": 4,
+            "daily_limit": 1500,
+            "contacts_limit": 20000,
+            "smtp_limit": 3,
+            "scraper_limit": 400,
+            "campaigns_limit": 10,
+            "ai_personalization": True,
+            "auto_followup": False,
+            "ads": False
+        },
+        "corporate": {
+            "name": "Corporate",
+            "price_ngn": 24000,
+            "price_usd": 15,
+            "daily_limit": 5000,
+            "contacts_limit": 100000,
+            "smtp_limit": 7,
+            "scraper_limit": 2000,
+            "campaigns_limit": 40,
+            "ai_personalization": True,
+            "auto_followup": True,
+            "ads": False
+        }
+    }
