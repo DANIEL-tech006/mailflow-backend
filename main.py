@@ -522,3 +522,21 @@ async def track_open(tracking_id: str):
     from fastapi.responses import Response
     pixel = base64.b64decode("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7")
     return Response(content=pixel, media_type="image/gif")
+
+
+
+    @app.delete("/admin/users/{user_id}")
+async def delete_user(user_id: str, user=Depends(get_current_user)):
+    try:
+        # Delete all user data first
+        supabase_admin.table("replies").delete().eq("user_id", user_id).execute()
+        supabase_admin.table("emails_sent").delete().eq("user_id", user_id).execute()
+        supabase_admin.table("campaigns").delete().eq("user_id", user_id).execute()
+        supabase_admin.table("scraped_contacts").delete().eq("user_id", user_id).execute()
+        supabase_admin.table("smtp_accounts").delete().eq("user_id", user_id).execute()
+        supabase_admin.table("users").delete().eq("id", user_id).execute()
+        # Delete from Supabase Auth
+        supabase_admin.auth.admin.delete_user(user_id)
+        return {"message": "User deleted successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
