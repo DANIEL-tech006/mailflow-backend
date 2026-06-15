@@ -525,7 +525,7 @@ async def track_open(tracking_id: str):
 
 
 
-    @app.delete("/admin/users/{user_id}")
+@app.delete("/admin/users/{user_id}")
 async def delete_user(user_id: str, user=Depends(get_current_user)):
     try:
         # Delete all user data first
