@@ -4,6 +4,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
 from typing import Optional, List
 import os, smtplib, ssl, logging, hmac, hashlib, json
+from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from dotenv import load_dotenv
@@ -606,7 +607,7 @@ async def verify_payment(reference: str, user=Depends(get_current_user)):
                 supabase_admin.table("users").update({
                     "plan": plan,
                     "daily_limit": plan_data["daily_limit"],
-                    "plan_expires_at": "now() + interval '30 days'"
+                    "plan_expires_at": (datetime.utcnow() + timedelta(days=30)).isoformat()
                 }).eq("id", user.id).execute()
                 supabase_admin.table("payments").insert({
                     "user_id": user.id,
@@ -644,6 +645,6 @@ async def paystack_webhook(request: Request):
             supabase_admin.table("users").update({
                 "plan": plan,
                 "daily_limit": plan_data["daily_limit"],
-                "plan_expires_at": "now() + interval '30 days'"
+                "plan_expires_at": (datetime.utcnow() + timedelta(days=30)).isoformat()
             }).eq("id", user_id).execute()
     return {"status": "ok"}
