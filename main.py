@@ -573,7 +573,7 @@ async def initiate_payment(data: InitiatePaymentModel, user=Depends(get_current_
                     "amount": amount,
                     "currency": data.currency,
                     "metadata": {"user_id": user.id, "plan": data.plan, "currency": data.currency},
-                    "callback_url": f"{frontend_url}/payment-success"
+                    "callback_url": frontend_url
                 }
             )
         result = res.json()
