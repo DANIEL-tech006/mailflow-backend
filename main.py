@@ -607,20 +607,31 @@ async def verify_payment(reference: str, user=Depends(get_current_user)):
                 supabase_admin.table("users").update({
                     "plan": plan,
                     "daily_limit": plan_data["daily_limit"],
+                    "contacts_limit": plan_data["contacts_limit"],
+                    "smtp_limit": plan_data["smtp_limit"],
+                    "scraper_limit": plan_data["scraper_limit"],
+                    "campaigns_limit": plan_data["campaigns_limit"],
                     "plan_expires_at": (datetime.utcnow() + timedelta(days=30)).isoformat()
                 }).eq("id", user.id).execute()
-                supabase_admin.table("payments").insert({
-                    "user_id": user.id,
-                    "plan": plan,
-                    "amount": result["data"]["amount"],
-                    "currency": result["data"]["currency"],
-                    "reference": reference,
-                    "status": "success"
-                }).execute()
+                try:
+                    supabase_admin.table("payments").insert({
+                        "user_id": user.id,
+                        "plan": plan,
+                        "amount": result["data"]["amount"],
+                        "currency": result["data"]["currency"],
+                        "reference": reference,
+                        "status": "success"
+                    }).execute()
+                except Exception:
+                    pass
                 return {
                     "message": f"Payment successful! {plan_data['name']} plan activated.",
                     "plan": plan,
-                    "daily_limit": plan_data["daily_limit"]
+                    "daily_limit": plan_data["daily_limit"],
+                    "contacts_limit": plan_data["contacts_limit"],
+                    "smtp_limit": plan_data["smtp_limit"],
+                    "scraper_limit": plan_data["scraper_limit"],
+                    "campaigns_limit": plan_data["campaigns_limit"]
                 }
         raise HTTPException(status_code=400, detail="Payment verification failed")
     except Exception as e:
@@ -642,9 +653,16 @@ async def paystack_webhook(request: Request):
         plan = metadata.get("plan")
         if user_id and plan and plan in PLANS:
             plan_data = PLANS[plan]
-            supabase_admin.table("users").update({
-                "plan": plan,
-                "daily_limit": plan_data["daily_limit"],
-                "plan_expires_at": (datetime.utcnow() + timedelta(days=30)).isoformat()
-            }).eq("id", user_id).execute()
+            try:
+                supabase_admin.table("users").update({
+                    "plan": plan,
+                    "daily_limit": plan_data["daily_limit"],
+                    "contacts_limit": plan_data["contacts_limit"],
+                    "smtp_limit": plan_data["smtp_limit"],
+                    "scraper_limit": plan_data["scraper_limit"],
+                    "campaigns_limit": plan_data["campaigns_limit"],
+                    "plan_expires_at": (datetime.utcnow() + timedelta(days=30)).isoformat()
+                }).eq("id", user_id).execute()
+            except Exception as e:
+                logger.error(f"Webhook plan update error: {e}")
     return {"status": "ok"}
