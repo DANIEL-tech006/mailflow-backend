@@ -103,29 +103,29 @@ class InitiatePaymentModel(BaseModel):
 # ── PLANS ──
 PLANS = {
     "personal": {
-        "name": "Personal",
-        "amount_ngn": 650000,
-        "amount_usd": 400,
-        "daily_limit": 1500,
-        "contacts_limit": 20000,
-        "smtp_limit": 3,
-        "scraper_limit": 400,
-        "campaigns_limit": 10,
-        "ai_personalization": True,
-        "auto_followup": False
-    },
-    "corporate": {
-        "name": "Corporate",
-        "amount_ngn": 2400000,
-        "amount_usd": 1500,
-        "daily_limit": 5000,
-        "contacts_limit": 100000,
-        "smtp_limit": 7,
-        "scraper_limit": 2000,
-        "campaigns_limit": 40,
-        "ai_personalization": True,
-        "auto_followup": True
-    }
+    "name": "Personal",
+    "amount_ngn": 650000,
+    "amount_usd": 400,
+    "daily_limit": 1500,
+    "contacts_limit": 20000,
+    "smtp_limit": 3,
+    "scraper_limit": 400,
+    "campaigns_limit": 25,
+    "ai_personalization": True,
+    "auto_followup": False
+},
+"corporate": {
+    "name": "Corporate",
+    "amount_ngn": 2400000,
+    "amount_usd": 1500,
+    "daily_limit": 5000,
+    "contacts_limit": 100000,
+    "smtp_limit": 10,
+    "scraper_limit": 2000,
+    "campaigns_limit": 55,
+    "ai_personalization": True,
+    "auto_followup": True
+}
 }
 
 # ══════════════════════════════
