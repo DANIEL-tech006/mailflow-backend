@@ -10,8 +10,7 @@ from email.mime.multipart import MIMEMultipart
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from cryptography.fernet import Fernet
-import base64, hashlib
-import httpx
+import base64, httpx
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -19,13 +18,15 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="MailFlow API", version="2.0.0")
 
+# CORS - explicitly allow all origins including Netlify
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
     expose_headers=["*"],
+    max_age=600,
 )
 
 supabase: Client = create_client(
@@ -43,8 +44,11 @@ security = HTTPBearer()
 def get_cipher():
     key = os.getenv("ENCRYPTION_KEY", "")
     if not key:
-        key = base64.urlsafe_b64encode(hashlib.sha256(b"mailflow-default-key").digest()).decode()
-    return Fernet(key.encode() if len(key) < 44 else key.encode())
+        key = base64.urlsafe_b64encode(__import__("hashlib").sha256(b"mailflow-default-key").digest()).decode()
+    try:
+        return Fernet(key.encode() if len(key) < 44 else key.encode())
+    except Exception:
+        return Fernet(base64.urlsafe_b64encode(__import__("hashlib").sha256(key.encode()).digest()))
 
 def encrypt_password(password: str) -> str:
     return get_cipher().encrypt(password.encode()).decode()
@@ -103,38 +107,48 @@ class InitiatePaymentModel(BaseModel):
 # ── PLANS ──
 PLANS = {
     "personal": {
-    "name": "Personal",
-    "amount_ngn": 650000,
-    "amount_usd": 400,
-    "daily_limit": 1500,
-    "contacts_limit": 20000,
-    "smtp_limit": 3,
-    "scraper_limit": 400,
-    "campaigns_limit": 25,
-    "ai_personalization": True,
-    "auto_followup": False
-},
-"corporate": {
-    "name": "Corporate",
-    "amount_ngn": 2400000,
-    "amount_usd": 1500,
-    "daily_limit": 5000,
-    "contacts_limit": 100000,
-    "smtp_limit": 10,
-    "scraper_limit": 2000,
-    "campaigns_limit": 55,
-    "ai_personalization": True,
-    "auto_followup": True
-}
+        "name": "Personal",
+        "amount_ngn": 650000,
+        "amount_usd": 400,
+        "daily_limit": 1200,
+        "contacts_limit": 20000,
+        "smtp_limit": 3,
+        "scraper_limit": 400,
+        "campaigns_limit": 25,
+        "ai_personalization": True,
+        "auto_followup": False
+    },
+    "corporate": {
+        "name": "Corporate",
+        "amount_ngn": 2400000,
+        "amount_usd": 1500,
+        "daily_limit": 4500,
+        "contacts_limit": 100000,
+        "smtp_limit": 10,
+        "scraper_limit": 2000,
+        "campaigns_limit": 55,
+        "ai_personalization": True,
+        "auto_followup": True
+    }
 }
 
 # ══════════════════════════════
-# AUTH
+# ROUTES
 # ══════════════════════════════
 
 @app.get("/")
 def root():
     return {"message": "MailFlow API v2.0 running", "status": "ok"}
+
+@app.get("/ping")
+def ping():
+    """Keep-alive endpoint — call this to wake Railway from sleep"""
+    return {"pong": True, "time": datetime.utcnow().isoformat()}
+
+@app.options("/{path:path}")
+async def options_handler(path: str):
+    """Handle CORS preflight for all routes"""
+    return {"ok": True}
 
 @app.post("/auth/register")
 async def register(data: RegisterModel):
@@ -145,14 +159,17 @@ async def register(data: RegisterModel):
             "options": {"data": {"full_name": data.full_name}}
         })
         if res.user:
-            supabase_admin.table("users").insert({
-                "id": res.user.id,
-                "email": data.email,
-                "full_name": data.full_name,
-                "plan": "free",
-                "daily_limit": 100,
-                "emails_sent_today": 0
-            }).execute()
+            try:
+                supabase_admin.table("users").insert({
+                    "id": res.user.id,
+                    "email": data.email,
+                    "full_name": data.full_name,
+                    "plan": "free",
+                    "daily_limit": 100,
+                    "emails_sent_today": 0
+                }).execute()
+            except Exception:
+                pass
             return {"message": "Account created. Check your email to verify.", "user_id": res.user.id}
         raise HTTPException(status_code=400, detail="Registration failed")
     except Exception as e:
@@ -163,51 +180,55 @@ async def login(data: LoginModel):
     try:
         res = supabase.auth.sign_in_with_password({"email": data.email, "password": data.password})
         if res.user:
-            profile = supabase_admin.table("users").select("*").eq("id", res.user.id).single().execute()
+            try:
+                profile = supabase_admin.table("users").select("*").eq("id", res.user.id).single().execute()
+                profile_data = profile.data or {}
+            except Exception:
+                profile_data = {}
             return {
                 "access_token": res.session.access_token,
                 "refresh_token": res.session.refresh_token,
                 "user": {
                     "id": res.user.id,
                     "email": res.user.email,
-                    "full_name": profile.data.get("full_name"),
-                    "plan": profile.data.get("plan"),
-                    "daily_limit": profile.data.get("daily_limit"),
-                    "emails_sent_today": profile.data.get("emails_sent_today", 0)
+                    "full_name": profile_data.get("full_name", res.user.email.split("@")[0]),
+                    "plan": profile_data.get("plan", "free"),
+                    "daily_limit": profile_data.get("daily_limit", 100),
+                    "emails_sent_today": profile_data.get("emails_sent_today", 0)
                 }
             }
         raise HTTPException(status_code=401, detail="Invalid credentials")
+    except HTTPException:
+        raise
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
 @app.get("/auth/me")
 async def get_me(user=Depends(get_current_user)):
-    profile = supabase_admin.table("users").select("*").eq("id", user.id).single().execute()
-    return profile.data
-
-# ══════════════════════════════
-# DASHBOARD
-# ══════════════════════════════
+    try:
+        profile = supabase_admin.table("users").select("*").eq("id", user.id).single().execute()
+        return profile.data
+    except Exception:
+        return {"id": user.id, "email": user.email, "plan": "free"}
 
 @app.get("/dashboard/stats")
 async def get_stats(user=Depends(get_current_user)):
     uid = user.id
-    campaigns = supabase_admin.table("campaigns").select("id", count="exact").eq("user_id", uid).execute()
-    contacts  = supabase_admin.table("scraped_contacts").select("id", count="exact").eq("user_id", uid).execute()
-    sent      = supabase_admin.table("emails_sent").select("id", count="exact").eq("user_id", uid).execute()
-    replies   = supabase_admin.table("replies").select("id", count="exact").eq("user_id", uid).execute()
-    unread    = supabase_admin.table("replies").select("id", count="exact").eq("user_id", uid).eq("is_read", False).execute()
-    return {
-        "campaigns": campaigns.count or 0,
-        "contacts": contacts.count or 0,
-        "emails_sent": sent.count or 0,
-        "replies": replies.count or 0,
-        "unread_replies": unread.count or 0
-    }
-
-# ══════════════════════════════
-# SMTP
-# ══════════════════════════════
+    try:
+        campaigns = supabase_admin.table("campaigns").select("id", count="exact").eq("user_id", uid).execute()
+        contacts  = supabase_admin.table("scraped_contacts").select("id", count="exact").eq("user_id", uid).execute()
+        sent      = supabase_admin.table("emails_sent").select("id", count="exact").eq("user_id", uid).execute()
+        replies   = supabase_admin.table("replies").select("id", count="exact").eq("user_id", uid).execute()
+        unread    = supabase_admin.table("replies").select("id", count="exact").eq("user_id", uid).eq("is_read", False).execute()
+        return {
+            "campaigns": campaigns.count or 0,
+            "contacts": contacts.count or 0,
+            "emails_sent": sent.count or 0,
+            "replies": replies.count or 0,
+            "unread_replies": unread.count or 0
+        }
+    except Exception:
+        return {"campaigns": 0, "contacts": 0, "emails_sent": 0, "replies": 0, "unread_replies": 0}
 
 @app.post("/smtp/add")
 async def add_smtp(data: SMTPModel, user=Depends(get_current_user)):
@@ -238,36 +259,40 @@ async def test_smtp(data: SendTestModel, user=Depends(get_current_user)):
     if not smtp_rec.data:
         raise HTTPException(status_code=404, detail="SMTP account not found")
     rec = smtp_rec.data
-    password = decrypt_password(rec["password_encrypted"])
+    try:
+        password = decrypt_password(rec["password_encrypted"])
+    except Exception:
+        raise HTTPException(status_code=400, detail="Could not decrypt password. Please re-add this SMTP account.")
     try:
         msg = MIMEMultipart("alternative")
         msg["Subject"] = data.subject
-        msg["From"] = rec['email']
+        msg["From"] = rec["email"]
         msg["To"] = data.to_email
-        msg.attach(MIMEText("<h2>MailFlow Test Email</h2><p>Your SMTP is working correctly!</p>", "html"))
+        msg.attach(MIMEText(
+            "<h2 style='color:#00d4aa'>MailFlow Test Email</h2><p>Your SMTP is configured correctly and working!</p><p>You can now send campaigns through MailFlow.</p>",
+            "html"
+        ))
         context = ssl.create_default_context()
-        with smtplib.SMTP(rec["host"], rec["port"], timeout=10) as server:
+        with smtplib.SMTP(rec["host"], rec["port"], timeout=15) as server:
             server.ehlo()
             server.starttls(context=context)
             server.login(rec["email"], password)
             server.sendmail(rec["email"], data.to_email, msg.as_string())
-        supabase_admin.table("smtp_accounts").update({"last_tested": "now()"}).eq("id", data.smtp_id).execute()
-        return {"message": "Test email sent successfully", "status": "ok"}
+        supabase_admin.table("smtp_accounts").update({"last_tested": datetime.utcnow().isoformat()}).eq("id", data.smtp_id).execute()
+        return {"message": "Test email sent successfully!", "status": "ok"}
     except smtplib.SMTPAuthenticationError:
-        raise HTTPException(status_code=400, detail="Authentication failed. Check your email and app password.")
+        raise HTTPException(status_code=400, detail="Authentication failed. Make sure you are using a Gmail App Password (not your regular Gmail password). Go to Google Account → Security → App Passwords.")
     except smtplib.SMTPConnectError:
-        raise HTTPException(status_code=400, detail="Could not connect to SMTP server.")
-    except Exception as e:
+        raise HTTPException(status_code=400, detail="Could not connect to SMTP server. Check host and port.")
+    except smtplib.SMTPException as e:
         raise HTTPException(status_code=400, detail=f"SMTP error: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error: {str(e)}")
 
 @app.delete("/smtp/{smtp_id}")
 async def delete_smtp(smtp_id: str, user=Depends(get_current_user)):
     supabase_admin.table("smtp_accounts").delete().eq("id", smtp_id).eq("user_id", user.id).execute()
     return {"message": "SMTP account deleted"}
-
-# ══════════════════════════════
-# CONTACTS
-# ══════════════════════════════
 
 @app.get("/contacts")
 async def get_contacts(user=Depends(get_current_user)):
@@ -284,10 +309,6 @@ async def add_contact(contact: dict, user=Depends(get_current_user)):
 async def delete_contact(contact_id: str, user=Depends(get_current_user)):
     supabase_admin.table("scraped_contacts").delete().eq("id", contact_id).eq("user_id", user.id).execute()
     return {"message": "Contact deleted"}
-
-# ══════════════════════════════
-# SCRAPER
-# ══════════════════════════════
 
 @app.post("/scraper/search")
 async def scrape_emails(data: ScrapeModel, user=Depends(get_current_user)):
@@ -337,12 +358,7 @@ async def scrape_emails(data: ScrapeModel, user=Depends(get_current_user)):
             logger.error(f"Hunter error: {e}")
 
     seen = set()
-    unique = []
-    for r in results:
-        if r["email"] not in seen:
-            seen.add(r["email"])
-            unique.append(r)
-
+    unique = [r for r in results if r["email"] not in seen and not seen.add(r["email"])]
     return {"results": unique, "count": len(unique), "niche": data.niche}
 
 @app.post("/scraper/save")
@@ -364,10 +380,6 @@ async def save_scraped(contacts: List[dict], user=Depends(get_current_user)):
         except Exception:
             pass
     return {"message": f"{saved} contacts saved", "saved": saved}
-
-# ══════════════════════════════
-# CAMPAIGNS
-# ══════════════════════════════
 
 @app.post("/campaigns/create")
 async def create_campaign(data: CampaignModel, user=Depends(get_current_user)):
@@ -399,13 +411,13 @@ async def send_campaign(campaign_id: str, background_tasks: BackgroundTasks, use
         raise HTTPException(status_code=404, detail="Campaign not found")
     smtp_list = supabase_admin.table("smtp_accounts").select("*").eq("user_id", user.id).eq("is_active", True).execute()
     if not smtp_list.data:
-        raise HTTPException(status_code=400, detail="No active SMTP accounts. Add one first.")
+        raise HTTPException(status_code=400, detail="No active SMTP accounts. Go to SMTP Settings and add one first.")
     contacts = supabase_admin.table("scraped_contacts").select("*").eq("user_id", user.id).execute()
     if not contacts.data:
-        raise HTTPException(status_code=400, detail="No contacts found.")
+        raise HTTPException(status_code=400, detail="No contacts found. Use Email Scraper to add contacts first.")
     background_tasks.add_task(send_bulk_emails, campaign=camp.data, contacts=contacts.data, smtp_accounts=smtp_list.data, user_id=user.id)
-    supabase_admin.table("campaigns").update({"status": "sending", "started_at": "now()"}).eq("id", campaign_id).execute()
-    return {"message": f"Campaign started. Sending to {len(contacts.data)} contacts.", "status": "sending"}
+    supabase_admin.table("campaigns").update({"status": "sending", "started_at": datetime.utcnow().isoformat()}).eq("id", campaign_id).execute()
+    return {"message": f"Campaign started! Sending to {len(contacts.data)} contacts.", "status": "sending"}
 
 async def send_bulk_emails(campaign: dict, contacts: list, smtp_accounts: list, user_id: str):
     import asyncio
@@ -432,7 +444,9 @@ async def send_bulk_emails(campaign: dict, contacts: list, smtp_accounts: list, 
             pixel = f'<img src="https://web-production-dd320.up.railway.app/track/{tracking_id}" width="1" height="1">'
             html_body = f"{body}<br><br>{pixel}<br><small>To unsubscribe, reply with UNSUBSCRIBE</small>"
             msg.attach(MIMEText(html_body, "html"))
-            msg.attach(MIMEText(f"{body}\n\nTo unsubscribe reply with UNSUBSCRIBE", "plain"))
+            msg.attach(MIMEText(f"{body}
+
+To unsubscribe reply with UNSUBSCRIBE", "plain"))
             context = ssl.create_default_context()
             with smtplib.SMTP(smtp["host"], smtp["port"], timeout=15) as server:
                 server.starttls(context=context)
@@ -448,16 +462,18 @@ async def send_bulk_emails(campaign: dict, contacts: list, smtp_accounts: list, 
                 "status": "sent",
                 "tracking_pixel_id": tracking_id
             }).execute()
-            supabase_admin.table("smtp_accounts").update({"sent_today": smtp["sent_today"] + 1}).eq("id", smtp["id"]).execute()
+            supabase_admin.table("smtp_accounts").update(
+                {"sent_today": smtp["sent_today"] + 1}
+            ).eq("id", smtp["id"]).execute()
             sent_count += 1
             await asyncio.sleep(1)
         except Exception as e:
             logger.error(f"Failed to send to {contact.get('email')}: {e}")
-    supabase_admin.table("campaigns").update({"status": "completed", "sent_count": sent_count, "completed_at": "now()"}).eq("id", campaign["id"]).execute()
-
-# ══════════════════════════════
-# INBOX
-# ══════════════════════════════
+    supabase_admin.table("campaigns").update({
+        "status": "completed",
+        "sent_count": sent_count,
+        "completed_at": datetime.utcnow().isoformat()
+    }).eq("id", campaign["id"]).execute()
 
 @app.get("/inbox/sent")
 async def get_sent(user=Depends(get_current_user)):
@@ -474,118 +490,62 @@ async def mark_read(reply_id: str, user=Depends(get_current_user)):
     supabase_admin.table("replies").update({"is_read": True}).eq("id", reply_id).eq("user_id", user.id).execute()
     return {"message": "Marked as read"}
 
-# ══════════════════════════════
-# TRACKING
-# ══════════════════════════════
-
 @app.get("/track/{tracking_id}")
 async def track_open(tracking_id: str):
     try:
-        supabase_admin.table("emails_sent").update({"is_opened": True, "opened_at": "now()"}).eq("tracking_pixel_id", tracking_id).execute()
+        supabase_admin.table("emails_sent").update(
+            {"is_opened": True, "opened_at": datetime.utcnow().isoformat()}
+        ).eq("tracking_pixel_id", tracking_id).execute()
     except Exception:
         pass
     from fastapi.responses import Response
     pixel = base64.b64decode("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7")
     return Response(content=pixel, media_type="image/gif")
 
-# ══════════════════════════════
-# ADMIN
-# ══════════════════════════════
-
 @app.delete("/admin/users/{user_id}")
 async def delete_user(user_id: str, user=Depends(get_current_user)):
     try:
-        supabase_admin.table("replies").delete().eq("user_id", user_id).execute()
-        supabase_admin.table("emails_sent").delete().eq("user_id", user_id).execute()
-        supabase_admin.table("campaigns").delete().eq("user_id", user_id).execute()
-        supabase_admin.table("scraped_contacts").delete().eq("user_id", user_id).execute()
-        supabase_admin.table("smtp_accounts").delete().eq("user_id", user_id).execute()
+        for table in ["replies", "emails_sent", "campaigns", "scraped_contacts", "smtp_accounts", "payments"]:
+            try:
+                supabase_admin.table(table).delete().eq("user_id", user_id).execute()
+            except Exception:
+                pass
         supabase_admin.table("users").delete().eq("id", user_id).execute()
         supabase_admin.auth.admin.delete_user(user_id)
         return {"message": "User deleted successfully"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-# ══════════════════════════════
-# PAYMENTS
-# ══════════════════════════════
-
 @app.get("/payments/plans")
 async def get_plans():
     return {
-        "free": {
-            "name": "Free",
-            "price_ngn": 0,
-            "price_usd": 0,
-            "daily_limit": 100,
-            "contacts_limit": 500,
-            "smtp_limit": 1,
-            "scraper_limit": 10,
-            "campaigns_limit": 1,
-            "ai_personalization": False,
-            "auto_followup": False,
-            "ads": True
-        },
-        "personal": {
-            "name": "Personal",
-            "price_ngn": 6500,
-            "price_usd": 4,
-            "daily_limit": 1500,
-            "contacts_limit": 20000,
-            "smtp_limit": 3,
-            "scraper_limit": 400,
-            "campaigns_limit": 10,
-            "ai_personalization": True,
-            "auto_followup": False,
-            "ads": False
-        },
-        "corporate": {
-            "name": "Corporate",
-            "price_ngn": 24000,
-            "price_usd": 15,
-            "daily_limit": 5000,
-            "contacts_limit": 100000,
-            "smtp_limit": 7,
-            "scraper_limit": 2000,
-            "campaigns_limit": 40,
-            "ai_personalization": True,
-            "auto_followup": True,
-            "ads": False
-        }
+        "free": {"name": "Free", "price_ngn": 0, "price_usd": 0, "daily_limit": 100, "contacts_limit": 500, "smtp_limit": 1, "scraper_limit": 10, "campaigns_limit": 5, "ai_personalization": False, "auto_followup": False, "ads": True},
+        "personal": {"name": "Personal", "price_ngn": 6500, "price_usd": 4, "daily_limit": 1200, "contacts_limit": 20000, "smtp_limit": 3, "scraper_limit": 400, "campaigns_limit": 25, "ai_personalization": True, "auto_followup": False, "ads": False},
+        "corporate": {"name": "Corporate", "price_ngn": 24000, "price_usd": 15, "daily_limit": 4500, "contacts_limit": 100000, "smtp_limit": 10, "scraper_limit": 2000, "campaigns_limit": 55, "ai_personalization": True, "auto_followup": True, "ads": False}
     }
 
 @app.post("/payments/initiate")
 async def initiate_payment(data: InitiatePaymentModel, user=Depends(get_current_user)):
     if data.plan not in PLANS:
-        raise HTTPException(status_code=400, detail="Invalid plan. Choose 'personal' or 'corporate'")
+        raise HTTPException(status_code=400, detail="Invalid plan")
     if data.currency not in ["NGN", "USD"]:
-        raise HTTPException(status_code=400, detail="Invalid currency. Choose 'NGN' or 'USD'")
+        raise HTTPException(status_code=400, detail="Invalid currency")
     plan = PLANS[data.plan]
     amount = plan["amount_ngn"] if data.currency == "NGN" else plan["amount_usd"]
     secret_key = os.getenv("PAYSTACK_SECRET_KEY")
-    frontend_url = os.getenv("FRONTEND_URL", "https://darling-moonbeam-cca341.netlify.app")
+    frontend_url = os.getenv("FRONTEND_URL", "https://effervescent-nasturtium-6a71c2.netlify.app")
     try:
         async with httpx.AsyncClient() as client:
             res = await client.post(
                 "https://api.paystack.co/transaction/initialize",
                 headers={"Authorization": f"Bearer {secret_key}", "Content-Type": "application/json"},
-                json={
-                    "email": user.email,
-                    "amount": amount,
-                    "currency": data.currency,
-                    "metadata": {"user_id": user.id, "plan": data.plan, "currency": data.currency},
-                    "callback_url": frontend_url
-                }
+                json={"email": user.email, "amount": amount, "currency": data.currency,
+                      "metadata": {"user_id": user.id, "plan": data.plan, "currency": data.currency},
+                      "callback_url": frontend_url}
             )
         result = res.json()
         if result.get("status"):
-            return {
-                "payment_url": result["data"]["authorization_url"],
-                "reference": result["data"]["reference"],
-                "plan": data.plan,
-                "amount": amount,
-                "currency": data.currency
-            }
+            return {"payment_url": result["data"]["authorization_url"], "reference": result["data"]["reference"], "plan": data.plan, "amount": amount, "currency": data.currency}
         raise HTTPException(status_code=400, detail="Payment initiation failed")
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -616,25 +576,24 @@ async def verify_payment(reference: str, user=Depends(get_current_user)):
                 }).eq("id", user.id).execute()
                 try:
                     supabase_admin.table("payments").insert({
-                        "user_id": user.id,
-                        "plan": plan,
+                        "user_id": user.id, "plan": plan,
                         "amount": result["data"]["amount"],
                         "currency": result["data"]["currency"],
-                        "reference": reference,
-                        "status": "success"
+                        "reference": reference, "status": "success"
                     }).execute()
                 except Exception:
                     pass
                 return {
                     "message": f"Payment successful! {plan_data['name']} plan activated.",
-                    "plan": plan,
-                    "daily_limit": plan_data["daily_limit"],
+                    "plan": plan, "daily_limit": plan_data["daily_limit"],
                     "contacts_limit": plan_data["contacts_limit"],
                     "smtp_limit": plan_data["smtp_limit"],
                     "scraper_limit": plan_data["scraper_limit"],
                     "campaigns_limit": plan_data["campaigns_limit"]
                 }
         raise HTTPException(status_code=400, detail="Payment verification failed")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -645,16 +604,16 @@ async def paystack_webhook(request: Request):
     signature = request.headers.get("x-paystack-signature", "")
     expected = hmac.new(secret_key.encode(), body, hashlib.sha512).hexdigest()
     if signature != expected:
-        raise HTTPException(status_code=400, detail="Invalid signature")
-    event = json.loads(body)
-    if event.get("event") == "charge.success":
-        data = event["data"]
-        metadata = data.get("metadata", {})
-        user_id = metadata.get("user_id")
-        plan = metadata.get("plan")
-        if user_id and plan and plan in PLANS:
-            plan_data = PLANS[plan]
-            try:
+        return {"status": "ok"}
+    try:
+        event = json.loads(body)
+        if event.get("event") == "charge.success":
+            data = event["data"]
+            metadata = data.get("metadata", {})
+            user_id = metadata.get("user_id")
+            plan = metadata.get("plan")
+            if user_id and plan and plan in PLANS:
+                plan_data = PLANS[plan]
                 supabase_admin.table("users").update({
                     "plan": plan,
                     "daily_limit": plan_data["daily_limit"],
@@ -664,6 +623,6 @@ async def paystack_webhook(request: Request):
                     "campaigns_limit": plan_data["campaigns_limit"],
                     "plan_expires_at": (datetime.utcnow() + timedelta(days=30)).isoformat()
                 }).eq("id", user_id).execute()
-            except Exception as e:
-                logger.error(f"Webhook plan update error: {e}")
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
     return {"status": "ok"}
