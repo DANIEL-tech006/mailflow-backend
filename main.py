@@ -639,3 +639,406 @@ async def paystack_webhook(request: Request):
     except Exception as e:
         logger.error("Webhook error: " + str(e))
     return {"status": "ok"}
+
+
+    # ══════════════════════════════════════════════════════════════
+# GOOGLE OAUTH ROUTES — Add to bottom of main.py
+# ══════════════════════════════════════════════════════════════
+# pip install google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client
+
+import json
+import base64
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request as GoogleRequest
+from googleapiclient.discovery import build
+
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+GOOGLE_REDIRECT_URI = os.getenv(
+    "GOOGLE_REDIRECT_URI",
+    "https://web-production-dd320.up.railway.app/auth/google/callback"
+)
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://effervescent-nasturtium-6a71c2.netlify.app")
+
+GMAIL_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/userinfo.profile",
+]
+
+class GmailAccountLabel(BaseModel):
+    label: str = "Gmail"
+    daily_limit: int = 500
+
+# ── Step 1: Start Google OAuth flow ──
+@app.get("/auth/google")
+async def google_auth(user=Depends(get_current_user)):
+    from urllib.parse import urlencode
+    params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": GOOGLE_REDIRECT_URI,
+        "response_type": "code",
+        "scope": " ".join(GMAIL_SCOPES),
+        "access_type": "offline",
+        "prompt": "consent",
+        "state": user.id,  # Pass user_id as state
+    }
+    auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
+    return {"auth_url": auth_url}
+
+# ── Step 2: Google redirects back here ──
+@app.get("/auth/google/callback")
+async def google_callback(code: str, state: str):
+    from fastapi.responses import RedirectResponse
+    import httpx
+
+    # Exchange code for tokens
+    try:
+        async with httpx.AsyncClient() as client:
+            token_res = await client.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "code": code,
+                    "client_id": GOOGLE_CLIENT_ID,
+                    "client_secret": GOOGLE_CLIENT_SECRET,
+                    "redirect_uri": GOOGLE_REDIRECT_URI,
+                    "grant_type": "authorization_code",
+                }
+            )
+        token_data = token_res.json()
+
+        if "error" in token_data:
+            return RedirectResponse(
+                url=FRONTEND_URL + "?gmail_error=" + token_data.get("error", "unknown")
+            )
+
+        access_token = token_data["access_token"]
+        refresh_token = token_data.get("refresh_token")
+        expires_in = token_data.get("expires_in", 3600)
+
+        if not refresh_token:
+            return RedirectResponse(
+                url=FRONTEND_URL + "?gmail_error=no_refresh_token"
+            )
+
+        # Get Gmail address
+        async with httpx.AsyncClient() as client:
+            profile_res = await client.get(
+                "https://www.googleapis.com/oauth2/v2/userinfo",
+                headers={"Authorization": "Bearer " + access_token}
+            )
+        profile = profile_res.json()
+        gmail_address = profile.get("email")
+        display_name = profile.get("name", gmail_address)
+
+        if not gmail_address:
+            return RedirectResponse(
+                url=FRONTEND_URL + "?gmail_error=no_email"
+            )
+
+        # Store in database
+        expires_at = (datetime.utcnow() + timedelta(seconds=expires_in)).isoformat()
+        user_id = state  # state contains user_id
+
+        try:
+            # Check if already exists
+            existing = supabase_admin.table("gmail_accounts").select("id").eq(
+                "user_id", user_id
+            ).eq("gmail_address", gmail_address).execute()
+
+            if existing.data:
+                # Update existing
+                supabase_admin.table("gmail_accounts").update({
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                    "token_expires_at": expires_at,
+                    "is_active": True,
+                    "display_name": display_name,
+                }).eq("user_id", user_id).eq("gmail_address", gmail_address).execute()
+            else:
+                # Insert new
+                supabase_admin.table("gmail_accounts").insert({
+                    "user_id": user_id,
+                    "gmail_address": gmail_address,
+                    "display_name": display_name,
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                    "token_expires_at": expires_at,
+                    "is_active": True,
+                    "sent_today": 0,
+                    "daily_limit": 500,
+                }).execute()
+
+        except Exception as e:
+            logger.error("DB error saving Gmail token: " + str(e))
+            return RedirectResponse(
+                url=FRONTEND_URL + "?gmail_error=db_error"
+            )
+
+        return RedirectResponse(
+            url=FRONTEND_URL + "?gmail_connected=" + gmail_address
+        )
+
+    except Exception as e:
+        logger.error("OAuth callback error: " + str(e))
+        return RedirectResponse(
+            url=FRONTEND_URL + "?gmail_error=callback_failed"
+        )
+
+# ── Step 3: List connected Gmail accounts ──
+@app.get("/gmail/accounts")
+async def list_gmail_accounts(user=Depends(get_current_user)):
+    result = supabase_admin.table("gmail_accounts").select(
+        "id, gmail_address, display_name, is_active, sent_today, daily_limit, last_used_at, created_at"
+    ).eq("user_id", user.id).execute()
+    return result.data
+
+# ── Step 4: Delete Gmail account ──
+@app.delete("/gmail/accounts/{account_id}")
+async def delete_gmail_account(account_id: str, user=Depends(get_current_user)):
+    supabase_admin.table("gmail_accounts").delete().eq(
+        "id", account_id
+    ).eq("user_id", user.id).execute()
+    return {"message": "Gmail account disconnected"}
+
+# ── Helper: Get fresh access token ──
+async def get_fresh_access_token(account: dict) -> str:
+    import httpx
+    # Check if current token is still valid
+    if account.get("token_expires_at"):
+        expires_at = datetime.fromisoformat(
+            account["token_expires_at"].replace("Z", "+00:00")
+        )
+        if expires_at > datetime.now(expires_at.tzinfo) + timedelta(minutes=5):
+            return account["access_token"]
+
+    # Refresh the token
+    async with httpx.AsyncClient() as client:
+        res = await client.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "refresh_token": account["refresh_token"],
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "grant_type": "refresh_token",
+            }
+        )
+    data = res.json()
+
+    if "error" in data:
+        raise Exception("Token refresh failed: " + data.get("error", "unknown"))
+
+    new_access_token = data["access_token"]
+    new_expires_at = (
+        datetime.utcnow() + timedelta(seconds=data.get("expires_in", 3600))
+    ).isoformat()
+
+    # Update in database
+    supabase_admin.table("gmail_accounts").update({
+        "access_token": new_access_token,
+        "token_expires_at": new_expires_at,
+    }).eq("id", account["id"]).execute()
+
+    return new_access_token
+
+# ── Helper: Send email via Gmail API ──
+async def send_via_gmail_api(
+    account: dict,
+    to_email: str,
+    subject: str,
+    html_body: str,
+    plain_body: str,
+    from_name: str = None,
+    reply_to: str = None
+) -> bool:
+    access_token = await get_fresh_access_token(account)
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = (from_name or account["display_name"] or account["gmail_address"]) + \
+                  " <" + account["gmail_address"] + ">"
+    msg["To"] = to_email
+    if reply_to:
+        msg["Reply-To"] = reply_to
+
+    msg.attach(MIMEText(plain_body, "plain"))
+    msg.attach(MIMEText(html_body, "html"))
+
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+
+    import httpx
+    async with httpx.AsyncClient() as client:
+        res = await client.post(
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            headers={
+                "Authorization": "Bearer " + access_token,
+                "Content-Type": "application/json",
+            },
+            json={"raw": raw}
+        )
+
+    if res.status_code not in [200, 202]:
+        raise Exception("Gmail API error: " + res.text)
+
+    # Update sent count
+    supabase_admin.table("gmail_accounts").update({
+        "sent_today": account["sent_today"] + 1,
+        "last_used_at": datetime.utcnow().isoformat(),
+    }).eq("id", account["id"]).execute()
+
+    return True
+
+# ── Step 5: Send test email via Gmail API ──
+class GmailTestModel(BaseModel):
+    account_id: str
+    to_email: str
+    subject: str = "Test Email from MailFlow"
+
+@app.post("/gmail/test")
+async def test_gmail(data: GmailTestModel, user=Depends(get_current_user)):
+    account_rec = supabase_admin.table("gmail_accounts").select("*").eq(
+        "id", data.account_id
+    ).eq("user_id", user.id).single().execute()
+
+    if not account_rec.data:
+        raise HTTPException(status_code=404, detail="Gmail account not found")
+
+    account = account_rec.data
+    try:
+        await send_via_gmail_api(
+            account=account,
+            to_email=data.to_email,
+            subject=data.subject,
+            html_body="<h2 style='color:#00d4aa'>MailFlow Test Email</h2><p>Your Gmail is connected and working!</p>",
+            plain_body="MailFlow Test Email - Your Gmail is connected and working!",
+        )
+        return {"message": "Test email sent successfully to " + data.to_email, "status": "ok"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Gmail send failed: " + str(e))
+
+# ── Step 6: Send campaign via Gmail API ──
+@app.post("/gmail/campaigns/{campaign_id}/send")
+async def send_gmail_campaign(
+    campaign_id: str,
+    background_tasks: BackgroundTasks,
+    user=Depends(get_current_user)
+):
+    camp = supabase_admin.table("campaigns").select("*").eq(
+        "id", campaign_id
+    ).eq("user_id", user.id).single().execute()
+    if not camp.data:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    gmail_accounts = supabase_admin.table("gmail_accounts").select("*").eq(
+        "user_id", user.id
+    ).eq("is_active", True).execute()
+    if not gmail_accounts.data:
+        raise HTTPException(
+            status_code=400,
+            detail="No Gmail accounts connected. Go to SMTP Settings and click Connect Gmail."
+        )
+
+    contacts = supabase_admin.table("scraped_contacts").select("*").eq(
+        "user_id", user.id
+    ).execute()
+    if not contacts.data:
+        raise HTTPException(
+            status_code=400,
+            detail="No contacts found. Use Email Scraper first."
+        )
+
+    background_tasks.add_task(
+        send_bulk_via_gmail,
+        campaign=camp.data,
+        contacts=contacts.data,
+        gmail_accounts=gmail_accounts.data,
+        user_id=user.id
+    )
+
+    supabase_admin.table("campaigns").update({
+        "status": "sending",
+        "started_at": datetime.utcnow().isoformat()
+    }).eq("id", campaign_id).execute()
+
+    return {
+        "message": "Campaign started! Sending to " + str(len(contacts.data)) + " contacts via Gmail API.",
+        "status": "sending"
+    }
+
+async def send_bulk_via_gmail(
+    campaign: dict,
+    contacts: list,
+    gmail_accounts: list,
+    user_id: str
+):
+    import asyncio
+    account_idx = 0
+    sent_count = 0
+
+    for contact in contacts:
+        try:
+            # Rotate accounts when limit hit
+            account = gmail_accounts[account_idx % len(gmail_accounts)]
+            if account["sent_today"] >= account["daily_limit"]:
+                account_idx += 1
+                if account_idx >= len(gmail_accounts):
+                    logger.info("All Gmail accounts hit daily limit")
+                    break
+                account = gmail_accounts[account_idx]
+
+            # Personalize body
+            body = campaign["template_body"].replace(
+                "{{name}}", contact.get("name", "there")
+            ).replace(
+                "{{company}}", contact.get("company", "your company")
+            )
+
+            tracking_id = campaign["id"] + "-" + contact["id"]
+            base_url = "https://web-production-dd320.up.railway.app"
+            pixel = '<img src="' + base_url + '/track/' + tracking_id + '" width="1" height="1">'
+            html_body = body + "<br><br>" + pixel + \
+                        "<br><small>To unsubscribe, reply UNSUBSCRIBE</small>"
+            plain_body = body + "\n\nTo unsubscribe reply UNSUBSCRIBE"
+
+            await send_via_gmail_api(
+                account=account,
+                to_email=contact["email"],
+                subject=campaign["subject"],
+                html_body=html_body,
+                plain_body=plain_body,
+                from_name=campaign.get("from_name"),
+                reply_to=campaign.get("reply_to"),
+            )
+
+            # Log sent email
+            supabase_admin.table("emails_sent").insert({
+                "user_id": user_id,
+                "campaign_id": campaign["id"],
+                "to_email": contact["email"],
+                "to_name": contact.get("name"),
+                "subject": campaign["subject"],
+                "status": "sent",
+                "tracking_pixel_id": tracking_id
+            }).execute()
+
+            # Update account sent count in memory
+            account["sent_today"] = account.get("sent_today", 0) + 1
+            sent_count += 1
+
+            # Smart delay - 2 seconds between emails to avoid spam
+            await asyncio.sleep(2)
+
+        except Exception as e:
+            logger.error(
+                "Failed to send to " + str(contact.get("email")) + ": " + str(e)
+            )
+
+    supabase_admin.table("campaigns").update({
+        "status": "completed",
+        "sent_count": sent_count,
+        "completed_at": datetime.utcnow().isoformat()
+    }).eq("id", campaign["id"]).execute()
+
+    logger.info("Campaign done. Sent: " + str(sent_count))
