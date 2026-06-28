@@ -396,6 +396,15 @@ async def get_campaigns(user=Depends(get_current_user)):
     result = supabase_admin.table("campaigns").select("*").eq("user_id", user.id).order("created_at", desc=True).execute()
     return result.data
 
+@app.delete("/campaigns/{campaign_id}")
+async def delete_campaign(campaign_id: str, user=Depends(get_current_user)):
+    try:
+        supabase_admin.table("emails_sent").delete().eq("campaign_id", campaign_id).execute()
+        supabase_admin.table("campaigns").delete().eq("id", campaign_id).eq("user_id", user.id).execute()
+        return {"message": "Campaign deleted"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
 @app.post("/campaigns/{campaign_id}/send")
 async def send_campaign(campaign_id: str, background_tasks: BackgroundTasks, user=Depends(get_current_user)):
     camp = supabase_admin.table("campaigns").select("*").eq("id", campaign_id).eq("user_id", user.id).single().execute()
@@ -640,8 +649,7 @@ async def paystack_webhook(request: Request):
         logger.error("Webhook error: " + str(e))
     return {"status": "ok"}
 
-
-    # ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
 # GOOGLE OAUTH ROUTES — Add to bottom of main.py
 # ══════════════════════════════════════════════════════════════
 # pip install google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client
