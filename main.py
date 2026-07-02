@@ -933,6 +933,14 @@ async def gmail_send(data: GmailSendModel, user=Depends(get_current_user)):
             plain_body=data.body,
             from_name=data.from_name,
         )
+        supabase_admin.table("emails_sent").insert({
+            "user_id": user.id,
+            "campaign_id": None,
+            "to_email": data.to_email,
+            "to_name": None,
+            "subject": data.subject,
+            "status": "sent",
+        }).execute()
         return {"message": "Email sent successfully to " + data.to_email, "status": "ok"}
     except Exception as e:
         raise HTTPException(status_code=400, detail="Gmail send failed: " + str(e))
