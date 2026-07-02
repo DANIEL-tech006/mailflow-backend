@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
 from typing import Optional, List
-import os, smtplib, ssl, logging, hmac, hashlib, json, base64, httpx
+import os, smtplib, ssl, logging, hmac, hashlib, json, base64, httpx, asyncio
 from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -63,6 +63,12 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
+async def require_admin(user=Depends(get_current_user)):
+    admin_email = os.getenv("ADMIN_EMAIL", "")
+    if not admin_email or (user.email or "").lower() != admin_email.lower():
+        raise HTTPException(status_code=403, detail="Admin access only")
+    return user
+
 class RegisterModel(BaseModel):
     email: EmailStr
     password: str
@@ -87,6 +93,7 @@ class CampaignModel(BaseModel):
     from_name: Optional[str] = None
     reply_to: Optional[str] = None
     contact_ids: Optional[List[str]] = []
+    niche: Optional[str] = None
 
 class SendTestModel(BaseModel):
     smtp_id: str
@@ -109,7 +116,7 @@ PLANS = {
         "daily_limit": 1200,
         "contacts_limit": 20000,
         "smtp_limit": 3,
-        "scraper_limit": 400,
+        "scraper_limit": 100,
         "campaigns_limit": 25,
         "ai_personalization": True,
         "auto_followup": False
@@ -121,7 +128,7 @@ PLANS = {
         "daily_limit": 4500,
         "contacts_limit": 100000,
         "smtp_limit": 10,
-        "scraper_limit": 2000,
+        "scraper_limit": 600,
         "campaigns_limit": 55,
         "ai_personalization": True,
         "auto_followup": True
@@ -210,15 +217,20 @@ async def get_stats(user=Depends(get_current_user)):
         sent = supabase_admin.table("emails_sent").select("id", count="exact").eq("user_id", uid).execute()
         replies = supabase_admin.table("replies").select("id", count="exact").eq("user_id", uid).execute()
         unread = supabase_admin.table("replies").select("id", count="exact").eq("user_id", uid).eq("is_read", False).execute()
+
+        quota = await get_scraper_quota(uid)
+
         return {
             "campaigns": campaigns.count or 0,
             "contacts": contacts.count or 0,
             "emails_sent": sent.count or 0,
             "replies": replies.count or 0,
-            "unread_replies": unread.count or 0
+            "unread_replies": unread.count or 0,
+            "scraper_used": quota["used"],
+            "scraper_limit": quota["limit"]
         }
     except Exception:
-        return {"campaigns": 0, "contacts": 0, "emails_sent": 0, "replies": 0, "unread_replies": 0}
+        return {"campaigns": 0, "contacts": 0, "emails_sent": 0, "replies": 0, "unread_replies": 0, "scraper_used": 0, "scraper_limit": 4}
 
 @app.post("/smtp/add")
 async def add_smtp(data: SMTPModel, user=Depends(get_current_user)):
@@ -298,8 +310,106 @@ async def delete_contact(contact_id: str, user=Depends(get_current_user)):
     supabase_admin.table("scraped_contacts").delete().eq("id", contact_id).eq("user_id", user.id).execute()
     return {"message": "Contact deleted"}
 
+import re as _re
+
+async def verify_single_email(email: str) -> dict:
+    """Check if an email is real/deliverable. Uses Hunter.io if configured,
+    falls back to a free syntax + mail-server (MX) check otherwise."""
+    hunter_key = os.getenv("HUNTER_API_KEY")
+    if hunter_key:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                res = await client.get(
+                    "https://api.hunter.io/v2/email-verifier",
+                    params={"email": email, "api_key": hunter_key}
+                )
+            if res.status_code == 200:
+                result = res.json().get("data", {}).get("result", "unknown")
+                mapping = {"deliverable": "valid", "undeliverable": "invalid", "risky": "risky"}
+                return {"status": mapping.get(result, "unknown"), "method": "hunter"}
+        except Exception as e:
+            logger.error("Hunter verify error for " + email + ": " + str(e))
+            # fall through to basic check below
+
+    # Free fallback: syntax check + does the domain actually have a mail server?
+    if not _re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", email):
+        return {"status": "invalid", "method": "basic"}
+    domain = email.split("@")[-1]
+    try:
+        import dns.resolver
+    except ImportError:
+        return {"status": "unknown", "method": "basic"}
+    try:
+        answers = dns.resolver.resolve(domain, "MX", lifetime=5)
+        if len(answers) > 0:
+            return {"status": "valid", "method": "basic"}
+    except Exception:
+        pass
+    return {"status": "invalid", "method": "basic"}
+
+class VerifyContactsModel(BaseModel):
+    contact_ids: Optional[List[str]] = None  # None = verify all unverified contacts
+
+@app.post("/contacts/verify")
+async def verify_contacts(data: VerifyContactsModel, user=Depends(get_current_user)):
+    query = supabase_admin.table("scraped_contacts").select("id,email").eq("user_id", user.id)
+    if data.contact_ids:
+        query = query.in_("id", data.contact_ids)
+    else:
+        query = query.eq("verification_status", "unverified")
+    contacts = query.limit(50).execute()
+
+    if not contacts.data:
+        return {"verified": 0, "results": {}, "message": "No unverified contacts found"}
+
+    results = {"valid": 0, "invalid": 0, "risky": 0, "unknown": 0}
+    for c in contacts.data:
+        v = await verify_single_email(c["email"])
+        status = v["status"]
+        results[status] = results.get(status, 0) + 1
+        supabase_admin.table("scraped_contacts").update({
+            "verification_status": status,
+            "is_verified": status == "valid",
+            "verified_at": datetime.utcnow().isoformat()
+        }).eq("id", c["id"]).execute()
+        await asyncio.sleep(0.3)  # gentle pacing to avoid rate limits
+
+    return {"verified": len(contacts.data), "results": results}
+
+async def get_scraper_quota(user_id: str) -> dict:
+    """Returns current scraper usage/limit, resetting the monthly counter if a new month started."""
+    profile = supabase_admin.table("users").select(
+        "scraper_limit, scraper_used_this_month, scraper_reset_month"
+    ).eq("id", user_id).single().execute()
+
+    limit = 4
+    used = 0
+    if profile.data:
+        limit = profile.data.get("scraper_limit") or 4
+        used = profile.data.get("scraper_used_this_month") or 0
+        current_month = datetime.utcnow().strftime("%Y-%m")
+        if profile.data.get("scraper_reset_month") != current_month:
+            used = 0
+            supabase_admin.table("users").update({
+                "scraper_used_this_month": 0,
+                "scraper_reset_month": current_month
+            }).eq("id", user_id).execute()
+    return {"limit": limit, "used": used, "remaining": max(limit - used, 0)}
+
 @app.post("/scraper/search")
 async def scrape_emails(data: ScrapeModel, user=Depends(get_current_user)):
+    quota = await get_scraper_quota(user.id)
+    if quota["remaining"] <= 0:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Scraper limit reached ({quota['used']}/{quota['limit']} this month). Upgrade your plan to scrape more contacts."
+        )
+
+    # Never request more than what's actually left on the plan — this is what
+    # actually protects real Hunter/Apollo credit spend, since they charge
+    # per email returned, not per email saved.
+    effective_limit = min(data.limit, quota["remaining"])
+
     results = []
     apollo_key = os.getenv("APOLLO_API_KEY")
     if apollo_key:
@@ -308,7 +418,7 @@ async def scrape_emails(data: ScrapeModel, user=Depends(get_current_user)):
                 res = await client.post(
                     "https://api.apollo.io/v1/mixed_people/search",
                     headers={"Content-Type": "application/json"},
-                    json={"api_key": apollo_key, "q_keywords": data.niche, "per_page": data.limit, "page": 1}
+                    json={"api_key": apollo_key, "q_keywords": data.niche, "per_page": effective_limit, "page": 1}
                 )
                 if res.status_code == 200:
                     for p in res.json().get("people", []):
@@ -325,12 +435,12 @@ async def scrape_emails(data: ScrapeModel, user=Depends(get_current_user)):
             logger.error("Apollo error: " + str(e))
 
     hunter_key = os.getenv("HUNTER_API_KEY")
-    if hunter_key and len(results) < data.limit:
+    if hunter_key and len(results) < effective_limit:
         try:
             async with httpx.AsyncClient(timeout=15) as client:
                 res = await client.get(
                     "https://api.hunter.io/v2/domain-search",
-                    params={"domain": data.niche.replace(" ", ""), "api_key": hunter_key, "limit": 10}
+                    params={"domain": data.niche.replace(" ", ""), "api_key": hunter_key, "limit": effective_limit - len(results)}
                 )
                 if res.status_code == 200:
                     rjson = res.json()
@@ -351,10 +461,26 @@ async def scrape_emails(data: ScrapeModel, user=Depends(get_current_user)):
         if r["email"] not in seen:
             seen.add(r["email"])
             unique.append(r)
-    return {"results": unique, "count": len(unique), "niche": data.niche}
+
+    # Count against the plan's quota based on what was actually fetched (real credits spent)
+    if unique:
+        supabase_admin.table("users").update({
+            "scraper_used_this_month": quota["used"] + len(unique)
+        }).eq("id", user.id).execute()
+
+    return {
+        "results": unique,
+        "count": len(unique),
+        "niche": data.niche,
+        "scraper_used": quota["used"] + len(unique),
+        "scraper_limit": quota["limit"]
+    }
 
 @app.post("/scraper/save")
 async def save_scraped(contacts: List[dict], user=Depends(get_current_user)):
+    # Quota was already enforced and counted at search time (that's when real
+    # credits are spent). Saving just copies already-fetched results into your
+    # permanent contacts list, so it doesn't spend anything further.
     saved = 0
     for c in contacts:
         try:
@@ -382,6 +508,7 @@ async def create_campaign(data: CampaignModel, user=Depends(get_current_user)):
         "template_body": data.template_body,
         "from_name": data.from_name,
         "reply_to": data.reply_to,
+        "niche": data.niche,
         "status": "draft",
         "total_contacts": len(data.contact_ids),
         "sent_count": 0,
@@ -413,9 +540,13 @@ async def send_campaign(campaign_id: str, background_tasks: BackgroundTasks, use
     smtp_list = supabase_admin.table("smtp_accounts").select("*").eq("user_id", user.id).eq("is_active", True).execute()
     if not smtp_list.data:
         raise HTTPException(status_code=400, detail="No SMTP accounts found. Add one in SMTP Settings first.")
-    contacts = supabase_admin.table("scraped_contacts").select("*").eq("user_id", user.id).execute()
+    contacts_query = supabase_admin.table("scraped_contacts").select("*").eq("user_id", user.id)
+    if camp.data.get("niche"):
+        contacts_query = contacts_query.eq("niche", camp.data["niche"])
+    contacts = contacts_query.execute()
+    contacts.data = [c for c in (contacts.data or []) if c.get("verification_status") != "invalid"]
     if not contacts.data:
-        raise HTTPException(status_code=400, detail="No contacts found. Use Email Scraper first.")
+        raise HTTPException(status_code=400, detail="No contacts found in this group. Use Email Scraper first.")
     background_tasks.add_task(
         send_bulk_emails,
         campaign=camp.data,
@@ -488,6 +619,87 @@ async def get_sent(user=Depends(get_current_user)):
     result = supabase_admin.table("emails_sent").select("*").eq("user_id", user.id).order("sent_at", desc=True).limit(100).execute()
     return result.data
 
+@app.post("/gmail/check-replies")
+async def check_replies(user=Depends(get_current_user)):
+    sent_rows = supabase_admin.table("emails_sent").select("*").eq(
+        "user_id", user.id
+    ).order("sent_at", desc=True).limit(200).execute()
+
+    rows_with_thread = [r for r in (sent_rows.data or []) if r.get("thread_id") and r.get("gmail_account_id")]
+    if not rows_with_thread:
+        return {"new_replies": 0}
+
+    # Cache gmail accounts so we don't refetch per row
+    account_ids = list({r["gmail_account_id"] for r in rows_with_thread})
+    accounts = {}
+    for aid in account_ids:
+        acc = supabase_admin.table("gmail_accounts").select("*").eq(
+            "id", aid
+        ).eq("user_id", user.id).single().execute()
+        if acc.data:
+            accounts[aid] = acc.data
+
+    seen_threads = set()
+    new_count = 0
+    import httpx
+
+    for row in rows_with_thread:
+        thread_id = row["thread_id"]
+        if thread_id in seen_threads:
+            continue
+        seen_threads.add(thread_id)
+
+        account = accounts.get(row["gmail_account_id"])
+        if not account:
+            continue
+
+        try:
+            access_token = await get_fresh_access_token(account)
+            async with httpx.AsyncClient() as client:
+                res = await client.get(
+                    "https://gmail.googleapis.com/gmail/v1/users/me/threads/" + thread_id,
+                    headers={"Authorization": "Bearer " + access_token},
+                    params={"format": "metadata", "metadataHeaders": ["From", "Subject"]}
+                )
+            if res.status_code != 200:
+                continue
+
+            thread = res.json()
+            for msg in thread.get("messages", []):
+                headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
+                from_header = headers.get("From", "")
+
+                # Skip messages we sent ourselves
+                if account["gmail_address"].lower() in from_header.lower():
+                    continue
+
+                msg_id = msg["id"]
+                existing = supabase_admin.table("replies").select("id").eq(
+                    "user_id", user.id
+                ).eq("gmail_message_id", msg_id).execute()
+                if existing.data:
+                    continue
+
+                from_name = from_header.split("<")[0].strip().strip('"') if "<" in from_header else from_header
+
+                supabase_admin.table("replies").insert({
+                    "user_id": user.id,
+                    "campaign_id": row.get("campaign_id"),
+                    "from_email": from_header,
+                    "from_name": from_name,
+                    "subject": headers.get("Subject", ""),
+                    "body": msg.get("snippet", ""),
+                    "is_read": False,
+                    "gmail_message_id": msg_id,
+                    "received_at": datetime.utcnow().isoformat(),
+                }).execute()
+                new_count += 1
+        except Exception as e:
+            logger.error("check_replies error for thread " + thread_id + ": " + str(e))
+            continue
+
+    return {"new_replies": new_count}
+
 @app.get("/inbox/replies")
 async def get_replies(user=Depends(get_current_user)):
     result = supabase_admin.table("replies").select("*").eq("user_id", user.id).order("received_at", desc=True).execute()
@@ -511,8 +723,56 @@ async def track_open(tracking_id: str):
     pixel = base64.b64decode("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7")
     return Response(content=pixel, media_type="image/gif")
 
+@app.get("/admin/stats")
+async def admin_stats(user=Depends(require_admin)):
+    all_users = supabase_admin.table("users").select(
+        "id, plan, scraper_used_this_month, scraper_limit, scraper_reset_month, created_at"
+    ).execute()
+    rows = all_users.data or []
+    current_month = datetime.utcnow().strftime("%Y-%m")
+
+    plan_counts = {"free": 0, "personal": 0, "corporate": 0}
+    total_credits_used = 0
+    for r in rows:
+        plan = (r.get("plan") or "free").lower()
+        plan_counts[plan] = plan_counts.get(plan, 0) + 1
+        if r.get("scraper_reset_month") == current_month:
+            total_credits_used += r.get("scraper_used_this_month") or 0
+
+    revenue_ngn = plan_counts.get("personal", 0) * PLANS["personal"]["amount_ngn"] / 100 + \
+                  plan_counts.get("corporate", 0) * PLANS["corporate"]["amount_ngn"] / 100
+    revenue_usd = plan_counts.get("personal", 0) * PLANS["personal"]["amount_usd"] / 100 + \
+                  plan_counts.get("corporate", 0) * PLANS["corporate"]["amount_usd"] / 100
+
+    max_possible_credits = plan_counts.get("free", 0) * 4 + \
+                            plan_counts.get("personal", 0) * 100 + \
+                            plan_counts.get("corporate", 0) * 600
+
+    total_contacts = supabase_admin.table("scraped_contacts").select("id", count="exact").execute()
+    total_sent = supabase_admin.table("emails_sent").select("id", count="exact").execute()
+    total_replies = supabase_admin.table("replies").select("id", count="exact").execute()
+
+    return {
+        "total_users": len(rows),
+        "plan_breakdown": plan_counts,
+        "revenue_ngn_monthly": revenue_ngn,
+        "revenue_usd_monthly": revenue_usd,
+        "scraper_credits_used_this_month": total_credits_used,
+        "scraper_credits_max_possible": max_possible_credits,
+        "total_contacts": total_contacts.count or 0,
+        "total_emails_sent": total_sent.count or 0,
+        "total_replies": total_replies.count or 0
+    }
+
+@app.get("/admin/users")
+async def admin_list_users(user=Depends(require_admin)):
+    result = supabase_admin.table("users").select(
+        "id, email, full_name, plan, scraper_used_this_month, scraper_limit, created_at"
+    ).order("created_at", desc=True).execute()
+    return result.data
+
 @app.delete("/admin/users/{user_id}")
-async def delete_user(user_id: str, user=Depends(get_current_user)):
+async def delete_user(user_id: str, user=Depends(require_admin)):
     try:
         for table in ["replies", "emails_sent", "campaigns", "scraped_contacts", "smtp_accounts", "payments"]:
             try:
@@ -528,9 +788,9 @@ async def delete_user(user_id: str, user=Depends(get_current_user)):
 @app.get("/payments/plans")
 async def get_plans():
     return {
-        "free": {"name": "Free", "price_ngn": 0, "price_usd": 0, "daily_limit": 100, "contacts_limit": 500, "smtp_limit": 1, "scraper_limit": 10, "campaigns_limit": 5, "ai_personalization": False, "auto_followup": False, "ads": True},
-        "personal": {"name": "Personal", "price_ngn": 6500, "price_usd": 4, "daily_limit": 1200, "contacts_limit": 20000, "smtp_limit": 3, "scraper_limit": 400, "campaigns_limit": 25, "ai_personalization": True, "auto_followup": False, "ads": False},
-        "corporate": {"name": "Corporate", "price_ngn": 24000, "price_usd": 15, "daily_limit": 4500, "contacts_limit": 100000, "smtp_limit": 10, "scraper_limit": 2000, "campaigns_limit": 55, "ai_personalization": True, "auto_followup": True, "ads": False}
+        "free": {"name": "Free", "price_ngn": 0, "price_usd": 0, "daily_limit": 100, "contacts_limit": 500, "smtp_limit": 1, "scraper_limit": 4, "campaigns_limit": 5, "ai_personalization": False, "auto_followup": False, "ads": True},
+        "personal": {"name": "Personal", "price_ngn": 6500, "price_usd": 4, "daily_limit": 1200, "contacts_limit": 20000, "smtp_limit": 3, "scraper_limit": 100, "campaigns_limit": 25, "ai_personalization": True, "auto_followup": False, "ads": False},
+        "corporate": {"name": "Corporate", "price_ngn": 24000, "price_usd": 15, "daily_limit": 4500, "contacts_limit": 100000, "smtp_limit": 10, "scraper_limit": 600, "campaigns_limit": 55, "ai_personalization": True, "auto_followup": True, "ads": False}
     }
 
 @app.post("/payments/initiate")
@@ -860,7 +1120,7 @@ async def send_via_gmail_api(
     plain_body: str,
     from_name: str = None,
     reply_to: str = None
-) -> bool:
+) -> dict:
     access_token = await get_fresh_access_token(account)
 
     msg = MIMEMultipart("alternative")
@@ -890,13 +1150,15 @@ async def send_via_gmail_api(
     if res.status_code not in [200, 202]:
         raise Exception("Gmail API error: " + res.text)
 
+    send_result = res.json()
+
     # Update sent count
     supabase_admin.table("gmail_accounts").update({
         "sent_today": account["sent_today"] + 1,
         "last_used_at": datetime.utcnow().isoformat(),
     }).eq("id", account["id"]).execute()
 
-    return True
+    return {"message_id": send_result.get("id"), "thread_id": send_result.get("threadId")}
 
 # ── Step 5: Send test email via Gmail API ──
 class GmailTestModel(BaseModel):
@@ -925,7 +1187,7 @@ async def gmail_send(data: GmailSendModel, user=Depends(get_current_user)):
     html_body = data.body.replace("\n", "<br>")
 
     try:
-        await send_via_gmail_api(
+        send_result = await send_via_gmail_api(
             account=account,
             to_email=data.to_email,
             subject=data.subject,
@@ -940,6 +1202,8 @@ async def gmail_send(data: GmailSendModel, user=Depends(get_current_user)):
             "to_name": None,
             "subject": data.subject,
             "status": "sent",
+            "thread_id": send_result.get("thread_id"),
+            "gmail_account_id": account["id"],
         }).execute()
         return {"message": "Email sent successfully to " + data.to_email, "status": "ok"}
     except Exception as e:
@@ -989,13 +1253,15 @@ async def send_gmail_campaign(
             detail="No Gmail accounts connected. Go to SMTP Settings and click Connect Gmail."
         )
 
-    contacts = supabase_admin.table("scraped_contacts").select("*").eq(
-        "user_id", user.id
-    ).execute()
+    contacts_query = supabase_admin.table("scraped_contacts").select("*").eq("user_id", user.id)
+    if camp.data.get("niche"):
+        contacts_query = contacts_query.eq("niche", camp.data["niche"])
+    contacts = contacts_query.execute()
+    contacts.data = [c for c in (contacts.data or []) if c.get("verification_status") != "invalid"]
     if not contacts.data:
         raise HTTPException(
             status_code=400,
-            detail="No contacts found. Use Email Scraper first."
+            detail="No contacts found in this group. Use Email Scraper or Add Contact first."
         )
 
     background_tasks.add_task(
@@ -1052,7 +1318,7 @@ async def send_bulk_via_gmail(
                         "<br><small>To unsubscribe, reply UNSUBSCRIBE</small>"
             plain_body = body + "\n\nTo unsubscribe reply UNSUBSCRIBE"
 
-            await send_via_gmail_api(
+            send_result = await send_via_gmail_api(
                 account=account,
                 to_email=contact["email"],
                 subject=campaign["subject"],
@@ -1070,7 +1336,9 @@ async def send_bulk_via_gmail(
                 "to_name": contact.get("name"),
                 "subject": campaign["subject"],
                 "status": "sent",
-                "tracking_pixel_id": tracking_id
+                "tracking_pixel_id": tracking_id,
+                "thread_id": send_result.get("thread_id"),
+                "gmail_account_id": account["id"],
             }).execute()
 
             # Update account sent count in memory
