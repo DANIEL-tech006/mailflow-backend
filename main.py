@@ -904,6 +904,39 @@ class GmailTestModel(BaseModel):
     to_email: str
     subject: str = "Test Email from MailFlow"
 
+# ── Send single custom email via Gmail API (used by Quick Send) ──
+class GmailSendModel(BaseModel):
+    account_id: str
+    to_email: str
+    subject: str
+    body: str
+    from_name: str = None
+
+@app.post("/gmail/send")
+async def gmail_send(data: GmailSendModel, user=Depends(get_current_user)):
+    account_rec = supabase_admin.table("gmail_accounts").select("*").eq(
+        "id", data.account_id
+    ).eq("user_id", user.id).single().execute()
+
+    if not account_rec.data:
+        raise HTTPException(status_code=404, detail="Gmail account not found")
+
+    account = account_rec.data
+    html_body = data.body.replace("\n", "<br>")
+
+    try:
+        await send_via_gmail_api(
+            account=account,
+            to_email=data.to_email,
+            subject=data.subject,
+            html_body=html_body,
+            plain_body=data.body,
+            from_name=data.from_name,
+        )
+        return {"message": "Email sent successfully to " + data.to_email, "status": "ok"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Gmail send failed: " + str(e))
+
 @app.post("/gmail/test")
 async def test_gmail(data: GmailTestModel, user=Depends(get_current_user)):
     account_rec = supabase_admin.table("gmail_accounts").select("*").eq(
@@ -982,6 +1015,7 @@ async def send_bulk_via_gmail(
     user_id: str
 ):
     import asyncio
+    import random
     account_idx = 0
     sent_count = 0
 
@@ -1035,8 +1069,8 @@ async def send_bulk_via_gmail(
             account["sent_today"] = account.get("sent_today", 0) + 1
             sent_count += 1
 
-            # Smart delay - 2 seconds between emails to avoid spam
-            await asyncio.sleep(2)
+            # Smart delay - randomized 3-8s between emails to avoid spam pattern detection
+            await asyncio.sleep(random.uniform(3, 8))
 
         except Exception as e:
             logger.error(
