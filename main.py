@@ -433,14 +433,16 @@ async def get_scraper_quota(user_id: str) -> dict:
     Bonus credits (from one-time top-up purchases) don't reset monthly and are used after
     the plan's monthly allowance runs out."""
     profile = supabase_admin.table("users").select(
-        "scraper_limit, scraper_used_this_month, scraper_reset_month, scraper_bonus_credits"
+        "plan, scraper_limit, scraper_used_this_month, scraper_reset_month, scraper_bonus_credits"
     ).eq("id", user_id).single().execute()
 
+    plan_fallback_limits = {"free": 4, "personal": 100, "corporate": 600}
     limit = 4
     used = 0
     bonus = 0
     if profile.data:
-        limit = profile.data.get("scraper_limit") or 4
+        plan = (profile.data.get("plan") or "free").lower()
+        limit = profile.data.get("scraper_limit") or plan_fallback_limits.get(plan, 4)
         used = profile.data.get("scraper_used_this_month") or 0
         bonus = profile.data.get("scraper_bonus_credits") or 0
         current_month = datetime.utcnow().strftime("%Y-%m")
