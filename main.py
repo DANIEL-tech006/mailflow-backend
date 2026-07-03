@@ -108,6 +108,12 @@ class InitiatePaymentModel(BaseModel):
     plan: str
     currency: str = "NGN"
 
+CREDIT_PACKS = {
+    "small": {"credits": 10, "amount_ngn": 100000, "amount_usd": 100},   # ₦1,000 / $1.00
+    "medium": {"credits": 50, "amount_ngn": 400000, "amount_usd": 400},  # ₦4,000 / $4.00
+    "large": {"credits": 150, "amount_ngn": 1000000, "amount_usd": 1000} # ₦10,000 / $10.00
+}
+
 PLANS = {
     "personal": {
         "name": "Personal",
@@ -227,7 +233,8 @@ async def get_stats(user=Depends(get_current_user)):
             "replies": replies.count or 0,
             "unread_replies": unread.count or 0,
             "scraper_used": quota["used"],
-            "scraper_limit": quota["limit"]
+            "scraper_limit": quota["limit"],
+            "scraper_bonus_credits": quota["bonus_credits"]
         }
     except Exception:
         return {"campaigns": 0, "contacts": 0, "emails_sent": 0, "replies": 0, "unread_replies": 0, "scraper_used": 0, "scraper_limit": 4}
@@ -305,6 +312,51 @@ async def add_contact(contact: dict, user=Depends(get_current_user)):
     result = supabase_admin.table("scraped_contacts").insert(contact).execute()
     return result.data[0]
 
+class BulkAddModel(BaseModel):
+    raw_text: str
+    niche: Optional[str] = None
+
+@app.post("/contacts/bulk-add")
+async def bulk_add_contacts(data: BulkAddModel, user=Depends(get_current_user)):
+    email_re = _re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+    lines = [l.strip() for l in data.raw_text.splitlines() if l.strip()]
+
+    parsed = []
+    skipped = 0
+    for line in lines:
+        # Supports: "email" | "name,email" | "name,email,company"
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) == 1:
+            name, email, company = "", parts[0], ""
+        elif len(parts) == 2:
+            name, email, company = parts[0], parts[1], ""
+        else:
+            name, email, company = parts[0], parts[1], parts[2]
+
+        if not email_re.match(email):
+            skipped += 1
+            continue
+
+        parsed.append({
+            "user_id": user.id,
+            "name": name,
+            "email": email,
+            "company": company,
+            "niche": data.niche or "",
+            "source": "manual",
+            "is_verified": False
+        })
+
+    added = 0
+    for c in parsed:
+        try:
+            supabase_admin.table("scraped_contacts").insert(c).execute()
+            added += 1
+        except Exception:
+            skipped += 1
+
+    return {"added": added, "skipped": skipped, "total_lines": len(lines)}
+
 @app.delete("/contacts/{contact_id}")
 async def delete_contact(contact_id: str, user=Depends(get_current_user)):
     supabase_admin.table("scraped_contacts").delete().eq("id", contact_id).eq("user_id", user.id).execute()
@@ -377,16 +429,20 @@ async def verify_contacts(data: VerifyContactsModel, user=Depends(get_current_us
     return {"verified": len(contacts.data), "results": results}
 
 async def get_scraper_quota(user_id: str) -> dict:
-    """Returns current scraper usage/limit, resetting the monthly counter if a new month started."""
+    """Returns current scraper usage/limit, resetting the monthly counter if a new month started.
+    Bonus credits (from one-time top-up purchases) don't reset monthly and are used after
+    the plan's monthly allowance runs out."""
     profile = supabase_admin.table("users").select(
-        "scraper_limit, scraper_used_this_month, scraper_reset_month"
+        "scraper_limit, scraper_used_this_month, scraper_reset_month, scraper_bonus_credits"
     ).eq("id", user_id).single().execute()
 
     limit = 4
     used = 0
+    bonus = 0
     if profile.data:
         limit = profile.data.get("scraper_limit") or 4
         used = profile.data.get("scraper_used_this_month") or 0
+        bonus = profile.data.get("scraper_bonus_credits") or 0
         current_month = datetime.utcnow().strftime("%Y-%m")
         if profile.data.get("scraper_reset_month") != current_month:
             used = 0
@@ -394,7 +450,14 @@ async def get_scraper_quota(user_id: str) -> dict:
                 "scraper_used_this_month": 0,
                 "scraper_reset_month": current_month
             }).eq("id", user_id).execute()
-    return {"limit": limit, "used": used, "remaining": max(limit - used, 0)}
+
+    monthly_remaining = max(limit - used, 0)
+    return {
+        "limit": limit,
+        "used": used,
+        "bonus_credits": bonus,
+        "remaining": monthly_remaining + bonus
+    }
 
 @app.post("/scraper/search")
 async def scrape_emails(data: ScrapeModel, user=Depends(get_current_user)):
@@ -462,18 +525,29 @@ async def scrape_emails(data: ScrapeModel, user=Depends(get_current_user)):
             seen.add(r["email"])
             unique.append(r)
 
-    # Count against the plan's quota based on what was actually fetched (real credits spent)
+    # Count against the plan's quota based on what was actually fetched (real credits spent).
+    # Draw from the monthly allowance first, then bonus (top-up) credits.
+    new_used = quota["used"]
+    new_bonus = quota["bonus_credits"]
     if unique:
+        spend = len(unique)
+        monthly_remaining = max(quota["limit"] - quota["used"], 0)
+        spend_from_monthly = min(spend, monthly_remaining)
+        spend_from_bonus = spend - spend_from_monthly
+        new_used = quota["used"] + spend_from_monthly
+        new_bonus = max(quota["bonus_credits"] - spend_from_bonus, 0)
         supabase_admin.table("users").update({
-            "scraper_used_this_month": quota["used"] + len(unique)
+            "scraper_used_this_month": new_used,
+            "scraper_bonus_credits": new_bonus
         }).eq("id", user.id).execute()
 
     return {
         "results": unique,
         "count": len(unique),
         "niche": data.niche,
-        "scraper_used": quota["used"] + len(unique),
-        "scraper_limit": quota["limit"]
+        "scraper_used": new_used,
+        "scraper_limit": quota["limit"],
+        "bonus_credits_remaining": new_bonus
     }
 
 @app.post("/scraper/save")
@@ -793,6 +867,56 @@ async def get_plans():
         "corporate": {"name": "Corporate", "price_ngn": 24000, "price_usd": 15, "daily_limit": 4500, "contacts_limit": 100000, "smtp_limit": 10, "scraper_limit": 600, "campaigns_limit": 55, "ai_personalization": True, "auto_followup": True, "ads": False}
     }
 
+class BuyCreditsModel(BaseModel):
+    pack: str
+    currency: str
+
+@app.get("/payments/credit-packs")
+async def get_credit_packs():
+    return CREDIT_PACKS
+
+@app.post("/payments/buy-credits")
+async def buy_credits(data: BuyCreditsModel, user=Depends(get_current_user)):
+    if data.pack not in CREDIT_PACKS:
+        raise HTTPException(status_code=400, detail="Invalid credit pack")
+    if data.currency not in ["NGN", "USD"]:
+        raise HTTPException(status_code=400, detail="Invalid currency")
+    pack = CREDIT_PACKS[data.pack]
+    amount = pack["amount_ngn"] if data.currency == "NGN" else pack["amount_usd"]
+    secret_key = os.getenv("PAYSTACK_SECRET_KEY")
+    frontend_url = os.getenv("FRONTEND_URL", "https://effervescent-nasturtium-6a71c2.netlify.app")
+    try:
+        async with httpx.AsyncClient() as client:
+            res = await client.post(
+                "https://api.paystack.co/transaction/initialize",
+                headers={"Authorization": "Bearer " + secret_key, "Content-Type": "application/json"},
+                json={
+                    "email": user.email,
+                    "amount": amount,
+                    "currency": data.currency,
+                    "metadata": {
+                        "user_id": user.id,
+                        "type": "credit_topup",
+                        "pack": data.pack,
+                        "credits": pack["credits"],
+                        "currency": data.currency
+                    },
+                    "callback_url": frontend_url
+                }
+            )
+        result = res.json()
+        if result.get("status"):
+            return {
+                "payment_url": result["data"]["authorization_url"],
+                "reference": result["data"]["reference"],
+                "credits": pack["credits"],
+                "amount": amount,
+                "currency": data.currency
+            }
+        raise HTTPException(status_code=400, detail="Payment initiation failed")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
 @app.post("/payments/initiate")
 async def initiate_payment(data: InitiatePaymentModel, user=Depends(get_current_user)):
     if data.plan not in PLANS:
@@ -841,6 +965,31 @@ async def verify_payment(reference: str, user=Depends(get_current_user)):
         result = res.json()
         if result.get("status") and result["data"]["status"] == "success":
             metadata = result["data"].get("metadata", {})
+
+            if metadata.get("type") == "credit_topup":
+                credits = metadata.get("credits", 0)
+                profile = supabase_admin.table("users").select("scraper_bonus_credits").eq("id", user.id).single().execute()
+                current_bonus = (profile.data or {}).get("scraper_bonus_credits") or 0
+                supabase_admin.table("users").update({
+                    "scraper_bonus_credits": current_bonus + credits
+                }).eq("id", user.id).execute()
+                try:
+                    supabase_admin.table("payments").insert({
+                        "user_id": user.id,
+                        "plan": "credit_topup_" + metadata.get("pack", ""),
+                        "amount": result["data"]["amount"],
+                        "currency": result["data"]["currency"],
+                        "reference": reference,
+                        "status": "success"
+                    }).execute()
+                except Exception:
+                    pass
+                return {
+                    "message": f"✅ {credits} scraper credits added to your account!",
+                    "credits_added": credits,
+                    "new_balance": current_bonus + credits
+                }
+
             plan = metadata.get("plan")
             if plan in PLANS:
                 plan_data = PLANS[plan]
@@ -893,6 +1042,16 @@ async def paystack_webhook(request: Request):
             data = event["data"]
             metadata = data.get("metadata", {})
             user_id = metadata.get("user_id")
+
+            if metadata.get("type") == "credit_topup" and user_id:
+                credits = metadata.get("credits", 0)
+                profile = supabase_admin.table("users").select("scraper_bonus_credits").eq("id", user_id).single().execute()
+                current_bonus = (profile.data or {}).get("scraper_bonus_credits") or 0
+                supabase_admin.table("users").update({
+                    "scraper_bonus_credits": current_bonus + credits
+                }).eq("id", user_id).execute()
+                return {"status": "ok"}
+
             plan = metadata.get("plan")
             if user_id and plan and plan in PLANS:
                 plan_data = PLANS[plan]
