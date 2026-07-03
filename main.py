@@ -1097,7 +1097,7 @@ GMAIL_SCOPES = [
 
 class GmailAccountLabel(BaseModel):
     label: str = "Gmail"
-    daily_limit: int = 500
+    daily_limit: int = 490
 
 # ── Step 1: Start Google OAuth flow ──
 @app.get("/auth/google")
@@ -1195,7 +1195,7 @@ async def google_callback(code: str, state: str):
                     "token_expires_at": expires_at,
                     "is_active": True,
                     "sent_today": 0,
-                    "daily_limit": 500,
+                    "daily_limit": 490,  # stay under Gmail's real 500/day cap to reduce flagging risk
                 }).execute()
 
         except Exception as e:
@@ -1218,9 +1218,10 @@ async def google_callback(code: str, state: str):
 @app.get("/gmail/accounts")
 async def list_gmail_accounts(user=Depends(get_current_user)):
     result = supabase_admin.table("gmail_accounts").select(
-        "id, gmail_address, display_name, is_active, sent_today, daily_limit, last_used_at, created_at"
+        "id, gmail_address, display_name, is_active, sent_today, daily_limit, last_used_at, last_reset_date, created_at"
     ).eq("user_id", user.id).execute()
-    return result.data
+    accounts = await reset_gmail_daily_counts(result.data or [])
+    return accounts
 
 # ── Step 4: Delete Gmail account ──
 @app.delete("/gmail/accounts/{account_id}")
@@ -1271,6 +1272,43 @@ async def get_fresh_access_token(account: dict) -> str:
     return new_access_token
 
 # ── Helper: Send email via Gmail API ──
+async def reset_gmail_daily_counts(accounts: list) -> list:
+    """Gmail's daily send limit resets every day - but sent_today never did on our side.
+    This checks each account's last reset date and zeroes the counter if a new day started."""
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    updated = []
+    for acc in accounts:
+        if acc.get("last_reset_date") != today:
+            supabase_admin.table("gmail_accounts").update({
+                "sent_today": 0,
+                "last_reset_date": today
+            }).eq("id", acc["id"]).execute()
+            acc["sent_today"] = 0
+            acc["last_reset_date"] = today
+        updated.append(acc)
+    return updated
+
+async def check_plan_daily_limit(user_id: str) -> dict:
+    """Your plan promises a certain number of emails/day (e.g. Personal = 1200).
+    This checks today's real total across all your connected Gmail accounts against that promise."""
+    profile = supabase_admin.table("users").select("daily_limit").eq("id", user_id).single().execute()
+    plan_limit = (profile.data or {}).get("daily_limit") or 100
+
+    accounts = supabase_admin.table("gmail_accounts").select(
+        "id, sent_today, last_reset_date"
+    ).eq("user_id", user_id).eq("is_active", True).execute()
+    accounts_data = await reset_gmail_daily_counts(accounts.data or [])
+    total_sent_today = sum(a.get("sent_today", 0) for a in accounts_data)
+
+    if total_sent_today >= plan_limit:
+        return {
+            "ok": False,
+            "message": f"You've reached your plan's daily sending limit ({total_sent_today}/{plan_limit}). Upgrade your plan or try again tomorrow.",
+            "sent_today": total_sent_today,
+            "limit": plan_limit
+        }
+    return {"ok": True, "sent_today": total_sent_today, "limit": plan_limit}
+
 async def send_via_gmail_api(
     account: dict,
     to_email: str,
@@ -1343,6 +1381,18 @@ async def gmail_send(data: GmailSendModel, user=Depends(get_current_user)):
         raise HTTPException(status_code=404, detail="Gmail account not found")
 
     account = account_rec.data
+    account = (await reset_gmail_daily_counts([account]))[0]
+
+    if account["sent_today"] >= account["daily_limit"]:
+        raise HTTPException(
+            status_code=403,
+            detail=f"This Gmail account has hit its daily limit ({account['sent_today']}/{account['daily_limit']}). Connect another account or try again tomorrow."
+        )
+
+    plan_check = await check_plan_daily_limit(user.id)
+    if not plan_check["ok"]:
+        raise HTTPException(status_code=403, detail=plan_check["message"])
+
     html_body = data.body.replace("\n", "<br>")
 
     try:
@@ -1412,6 +1462,12 @@ async def send_gmail_campaign(
             detail="No Gmail accounts connected. Go to SMTP Settings and click Connect Gmail."
         )
 
+    gmail_accounts.data = await reset_gmail_daily_counts(gmail_accounts.data)
+
+    plan_check = await check_plan_daily_limit(user.id)
+    if not plan_check["ok"]:
+        raise HTTPException(status_code=403, detail=plan_check["message"])
+
     contacts_query = supabase_admin.table("scraped_contacts").select("*").eq("user_id", user.id)
     if camp.data.get("niche"):
         contacts_query = contacts_query.eq("niche", camp.data["niche"])
@@ -1454,6 +1510,11 @@ async def send_bulk_via_gmail(
 
     for contact in contacts:
         try:
+            plan_check = await check_plan_daily_limit(user_id)
+            if not plan_check["ok"]:
+                logger.info("Campaign stopped: plan daily limit reached (" + str(plan_check["sent_today"]) + "/" + str(plan_check["limit"]) + ")")
+                break
+
             # Rotate accounts when limit hit
             account = gmail_accounts[account_idx % len(gmail_accounts)]
             if account["sent_today"] >= account["daily_limit"]:
