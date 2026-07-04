@@ -178,6 +178,24 @@ async def register(data: RegisterModel):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+class RefreshModel(BaseModel):
+    refresh_token: str
+
+@app.post("/auth/refresh")
+async def refresh_session(data: RefreshModel):
+    try:
+        res = supabase.auth.refresh_session(data.refresh_token)
+        if res.session:
+            return {
+                "access_token": res.session.access_token,
+                "refresh_token": res.session.refresh_token
+            }
+        raise HTTPException(status_code=401, detail="Session expired, please log in again")
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=401, detail="Session expired, please log in again")
+
 @app.post("/auth/login")
 async def login(data: LoginModel):
     try:
