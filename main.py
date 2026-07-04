@@ -1292,9 +1292,12 @@ async def list_gmail_accounts(user=Depends(get_current_user)):
 # ── Step 4: Delete Gmail account ──
 @app.delete("/gmail/accounts/{account_id}")
 async def delete_gmail_account(account_id: str, user=Depends(get_current_user)):
-    supabase_admin.table("gmail_accounts").delete().eq(
-        "id", account_id
-    ).eq("user_id", user.id).execute()
+    # Soft-delete only - deactivate but keep sent_today history intact.
+    # A hard delete would let someone disconnect+reconnect to reset their daily
+    # counter, silently letting real usage exceed the safe limit without us knowing.
+    supabase_admin.table("gmail_accounts").update({
+        "is_active": False
+    }).eq("id", account_id).eq("user_id", user.id).execute()
     return {"message": "Gmail account disconnected"}
 
 # ── Helper: Get fresh access token ──
