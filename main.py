@@ -232,9 +232,29 @@ async def get_me(user=Depends(get_current_user)):
     except Exception:
         return {"id": user.id, "email": user.email, "plan": "free"}
 
+async def maybe_cleanup_old_records(user_id: str):
+    """Deletes sent emails and replies older than 90 days, for privacy/security.
+    Throttled to check once per day per user, not on every dashboard poll."""
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    try:
+        profile = supabase_admin.table("users").select("last_cleanup_date").eq("id", user_id).single().execute()
+        if profile.data and profile.data.get("last_cleanup_date") == today:
+            return
+    except Exception:
+        pass
+
+    cutoff = (datetime.utcnow() - timedelta(days=90)).isoformat()
+    try:
+        supabase_admin.table("emails_sent").delete().eq("user_id", user_id).lt("sent_at", cutoff).execute()
+        supabase_admin.table("replies").delete().eq("user_id", user_id).lt("received_at", cutoff).execute()
+        supabase_admin.table("users").update({"last_cleanup_date": today}).eq("id", user_id).execute()
+    except Exception as e:
+        logger.error("maybe_cleanup_old_records failed for user " + user_id + ": " + str(e))
+
 @app.get("/dashboard/stats")
 async def get_stats(user=Depends(get_current_user)):
     uid = user.id
+    await maybe_cleanup_old_records(uid)
     try:
         campaigns = supabase_admin.table("campaigns").select("id", count="exact").eq("user_id", uid).execute()
         contacts = supabase_admin.table("scraped_contacts").select("id", count="exact").eq("user_id", uid).execute()
@@ -764,6 +784,7 @@ async def check_replies(user=Depends(get_current_user)):
                     params={"format": "metadata", "metadataHeaders": ["From", "Subject"]}
                 )
             if res.status_code != 200:
+                logger.error(f"check_replies: Gmail threads.get failed for thread {thread_id} - status {res.status_code}, body: {res.text[:300]}")
                 continue
 
             thread = res.json()
@@ -1135,6 +1156,7 @@ FRONTEND_URL = os.getenv("FRONTEND_URL", "https://effervescent-nasturtium-6a71c2
 
 GMAIL_SCOPES = [
     "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/userinfo.profile",
 ]
