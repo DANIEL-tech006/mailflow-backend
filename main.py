@@ -450,26 +450,34 @@ async def get_scraper_quota(user_id: str) -> dict:
     """Returns current scraper usage/limit, resetting the monthly counter if a new month started.
     Bonus credits (from one-time top-up purchases) don't reset monthly and are used after
     the plan's monthly allowance runs out."""
-    profile = supabase_admin.table("users").select(
-        "plan, scraper_limit, scraper_used_this_month, scraper_reset_month, scraper_bonus_credits"
-    ).eq("id", user_id).single().execute()
+    try:
+        profile = supabase_admin.table("users").select(
+            "plan, scraper_limit, scraper_used_this_month, scraper_reset_month, scraper_bonus_credits"
+        ).eq("id", user_id).single().execute()
+        profile_data = profile.data
+    except Exception as e:
+        logger.error("get_scraper_quota query failed for user " + user_id + ": " + str(e))
+        profile_data = None
 
     plan_fallback_limits = {"free": 4, "personal": 100, "corporate": 600}
     limit = 4
     used = 0
     bonus = 0
-    if profile.data:
-        plan = (profile.data.get("plan") or "free").lower()
-        limit = profile.data.get("scraper_limit") or plan_fallback_limits.get(plan, 4)
-        used = profile.data.get("scraper_used_this_month") or 0
-        bonus = profile.data.get("scraper_bonus_credits") or 0
+    if profile_data:
+        plan = (profile_data.get("plan") or "free").lower()
+        limit = profile_data.get("scraper_limit") or plan_fallback_limits.get(plan, 4)
+        used = profile_data.get("scraper_used_this_month") or 0
+        bonus = profile_data.get("scraper_bonus_credits") or 0
         current_month = datetime.utcnow().strftime("%Y-%m")
-        if profile.data.get("scraper_reset_month") != current_month:
+        if profile_data.get("scraper_reset_month") != current_month:
             used = 0
-            supabase_admin.table("users").update({
-                "scraper_used_this_month": 0,
-                "scraper_reset_month": current_month
-            }).eq("id", user_id).execute()
+            try:
+                supabase_admin.table("users").update({
+                    "scraper_used_this_month": 0,
+                    "scraper_reset_month": current_month
+                }).eq("id", user_id).execute()
+            except Exception as e:
+                logger.error("get_scraper_quota reset update failed: " + str(e))
 
     monthly_remaining = max(limit - used, 0)
     return {
@@ -819,12 +827,16 @@ async def track_open(tracking_id: str):
 
 @app.get("/admin/stats")
 async def admin_stats(user=Depends(require_admin)):
-    all_users = supabase_admin.table("users").select(
-        "id, plan, scraper_used_this_month, scraper_limit, scraper_reset_month, created_at"
-    ).execute()
-    rows = all_users.data or []
-    current_month = datetime.utcnow().strftime("%Y-%m")
+    try:
+        all_users = supabase_admin.table("users").select(
+            "id, plan, scraper_used_this_month, scraper_limit, scraper_reset_month, created_at"
+        ).execute()
+        rows = all_users.data or []
+    except Exception as e:
+        logger.error("admin_stats users query failed: " + str(e))
+        rows = []
 
+    current_month = datetime.utcnow().strftime("%Y-%m")
     plan_counts = {"free": 0, "personal": 0, "corporate": 0}
     total_credits_used = 0
     for r in rows:
@@ -842,9 +854,21 @@ async def admin_stats(user=Depends(require_admin)):
                             plan_counts.get("personal", 0) * 100 + \
                             plan_counts.get("corporate", 0) * 600
 
-    total_contacts = supabase_admin.table("scraped_contacts").select("id", count="exact").execute()
-    total_sent = supabase_admin.table("emails_sent").select("id", count="exact").execute()
-    total_replies = supabase_admin.table("replies").select("id", count="exact").execute()
+    try:
+        total_contacts = supabase_admin.table("scraped_contacts").select("id", count="exact").execute()
+        contacts_count = total_contacts.count or 0
+    except Exception:
+        contacts_count = 0
+    try:
+        total_sent = supabase_admin.table("emails_sent").select("id", count="exact").execute()
+        sent_count = total_sent.count or 0
+    except Exception:
+        sent_count = 0
+    try:
+        total_replies = supabase_admin.table("replies").select("id", count="exact").execute()
+        replies_count = total_replies.count or 0
+    except Exception:
+        replies_count = 0
 
     return {
         "total_users": len(rows),
@@ -853,9 +877,9 @@ async def admin_stats(user=Depends(require_admin)):
         "revenue_usd_monthly": revenue_usd,
         "scraper_credits_used_this_month": total_credits_used,
         "scraper_credits_max_possible": max_possible_credits,
-        "total_contacts": total_contacts.count or 0,
-        "total_emails_sent": total_sent.count or 0,
-        "total_replies": total_replies.count or 0
+        "total_contacts": contacts_count,
+        "total_emails_sent": sent_count,
+        "total_replies": replies_count
     }
 
 @app.get("/admin/users")
