@@ -94,6 +94,7 @@ class CampaignModel(BaseModel):
     reply_to: Optional[str] = None
     contact_ids: Optional[List[str]] = []
     niche: Optional[str] = None
+    status: Optional[str] = "draft"
 
 class SendTestModel(BaseModel):
     smtp_id: str
@@ -631,7 +632,7 @@ async def create_campaign(data: CampaignModel, user=Depends(get_current_user)):
         "from_name": data.from_name,
         "reply_to": data.reply_to,
         "niche": data.niche,
-        "status": "draft",
+        "status": data.status or "draft",
         "total_contacts": len(data.contact_ids),
         "sent_count": 0,
         "open_count": 0,
@@ -639,6 +640,20 @@ async def create_campaign(data: CampaignModel, user=Depends(get_current_user)):
         "is_ai_personalized": True
     }).execute()
     return result.data[0]
+
+class CampaignStatusUpdate(BaseModel):
+    status: str
+    sent_count: Optional[int] = None
+
+@app.patch("/campaigns/{campaign_id}/status")
+async def update_campaign_status(campaign_id: str, data: CampaignStatusUpdate, user=Depends(get_current_user)):
+    update = {"status": data.status}
+    if data.sent_count is not None:
+        update["sent_count"] = data.sent_count
+    if data.status == "completed":
+        update["completed_at"] = datetime.utcnow().isoformat()
+    supabase_admin.table("campaigns").update(update).eq("id", campaign_id).eq("user_id", user.id).execute()
+    return {"message": "Updated"}
 
 @app.get("/campaigns")
 async def get_campaigns(user=Depends(get_current_user)):
@@ -831,6 +846,8 @@ async def check_replies(user=Depends(get_current_user)):
                     "body": msg.get("snippet", ""),
                     "is_read": False,
                     "gmail_message_id": msg_id,
+                    "gmail_account_id": account["id"],
+                    "thread_id": thread_id,
                     "received_at": datetime.utcnow().isoformat(),
                 }).execute()
                 new_count += 1
@@ -1429,7 +1446,8 @@ async def send_via_gmail_api(
     html_body: str,
     plain_body: str,
     from_name: str = None,
-    reply_to: str = None
+    reply_to: str = None,
+    thread_id: str = None
 ) -> dict:
     access_token = await get_fresh_access_token(account)
 
@@ -1445,6 +1463,9 @@ async def send_via_gmail_api(
     msg.attach(MIMEText(html_body, "html"))
 
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+    payload = {"raw": raw}
+    if thread_id:
+        payload["threadId"] = thread_id
 
     import httpx
     async with httpx.AsyncClient() as client:
@@ -1454,7 +1475,7 @@ async def send_via_gmail_api(
                 "Authorization": "Bearer " + access_token,
                 "Content-Type": "application/json",
             },
-            json={"raw": raw}
+            json=payload
         )
 
     if res.status_code not in [200, 202]:
