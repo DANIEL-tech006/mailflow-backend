@@ -643,7 +643,20 @@ async def create_campaign(data: CampaignModel, user=Depends(get_current_user)):
 @app.get("/campaigns")
 async def get_campaigns(user=Depends(get_current_user)):
     result = supabase_admin.table("campaigns").select("*").eq("user_id", user.id).order("created_at", desc=True).execute()
-    return result.data
+    campaigns = result.data or []
+    # open_count/reply_count on the campaigns table itself are never updated after creation -
+    # compute the real numbers live from emails_sent/replies instead of showing frozen zeros
+    for camp in campaigns:
+        try:
+            sent = supabase_admin.table("emails_sent").select("id", count="exact").eq("campaign_id", camp["id"]).execute()
+            opened = supabase_admin.table("emails_sent").select("id", count="exact").eq("campaign_id", camp["id"]).eq("is_opened", True).execute()
+            replies = supabase_admin.table("replies").select("id", count="exact").eq("campaign_id", camp["id"]).execute()
+            camp["sent_count"] = sent.count or 0
+            camp["open_count"] = opened.count or 0
+            camp["reply_count"] = replies.count or 0
+        except Exception as e:
+            logger.error("campaign live-stats failed for " + str(camp.get("id")) + ": " + str(e))
+    return campaigns
 
 @app.delete("/campaigns/{campaign_id}")
 async def delete_campaign(campaign_id: str, user=Depends(get_current_user)):
