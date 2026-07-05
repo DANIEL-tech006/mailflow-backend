@@ -768,11 +768,15 @@ async def check_replies(user=Depends(get_current_user)):
     account_ids = list({r["gmail_account_id"] for r in rows_with_thread})
     accounts = {}
     for aid in account_ids:
-        acc = supabase_admin.table("gmail_accounts").select("*").eq(
-            "id", aid
-        ).eq("user_id", user.id).single().execute()
-        if acc.data:
-            accounts[aid] = acc.data
+        try:
+            acc = supabase_admin.table("gmail_accounts").select("*").eq(
+                "id", aid
+            ).eq("user_id", user.id).execute()
+            if acc.data:
+                accounts[aid] = acc.data[0]
+        except Exception as e:
+            logger.error("check_replies: could not load gmail_account " + str(aid) + ": " + str(e))
+            continue
 
     seen_threads = set()
     new_count = 0
@@ -858,6 +862,33 @@ async def track_open(tracking_id: str):
     from fastapi.responses import Response
     pixel = base64.b64decode("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7")
     return Response(content=pixel, media_type="image/gif")
+
+class AnnouncementModel(BaseModel):
+    title: str
+    body: str = ""
+    media_url: Optional[str] = None
+    media_type: Optional[str] = None  # 'image', 'video', or None
+
+@app.get("/announcements")
+async def get_announcements(user=Depends(get_current_user)):
+    result = supabase_admin.table("announcements").select("*").order("created_at", desc=True).limit(30).execute()
+    return result.data or []
+
+@app.post("/admin/announcements")
+async def create_announcement(data: AnnouncementModel, user=Depends(require_admin)):
+    result = supabase_admin.table("announcements").insert({
+        "title": data.title,
+        "body": data.body,
+        "media_url": data.media_url,
+        "media_type": data.media_type,
+        "created_by": user.email
+    }).execute()
+    return result.data[0]
+
+@app.delete("/admin/announcements/{announcement_id}")
+async def delete_announcement(announcement_id: str, user=Depends(require_admin)):
+    supabase_admin.table("announcements").delete().eq("id", announcement_id).execute()
+    return {"message": "Announcement deleted"}
 
 @app.get("/admin/stats")
 async def admin_stats(user=Depends(require_admin)):
@@ -1492,6 +1523,7 @@ async def gmail_send(data: GmailSendModel, user=Depends(get_current_user)):
             "to_email": data.to_email,
             "to_name": None,
             "subject": data.subject,
+            "body": data.body,
             "status": "sent",
             "thread_id": send_result.get("thread_id"),
             "gmail_account_id": account["id"],
@@ -1637,6 +1669,7 @@ async def send_bulk_via_gmail(
                 "to_email": contact["email"],
                 "to_name": contact.get("name"),
                 "subject": campaign["subject"],
+                "body": plain_body,
                 "status": "sent",
                 "tracking_pixel_id": tracking_id,
                 "thread_id": send_result.get("thread_id"),
