@@ -1,4 +1,5 @@
-from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Request, UploadFile, File
+import uuid
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
@@ -196,6 +197,17 @@ async def refresh_session(data: RefreshModel):
         raise
     except Exception:
         raise HTTPException(status_code=401, detail="Session expired, please log in again")
+
+class ResendConfirmModel(BaseModel):
+    email: str
+
+@app.post("/auth/resend-confirmation")
+async def resend_confirmation(data: ResendConfirmModel):
+    try:
+        supabase.auth.resend({"type": "signup", "email": data.email})
+        return {"message": "Confirmation email resent. Please check your inbox (and spam folder)."}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Could not resend confirmation email: " + str(e))
 
 @app.post("/auth/login")
 async def login(data: LoginModel):
@@ -404,8 +416,35 @@ async def delete_contact(contact_id: str, user=Depends(get_current_user)):
 import re as _re
 
 async def verify_single_email(email: str) -> dict:
-    """Check if an email is real/deliverable. Uses Hunter.io if configured,
-    falls back to a free syntax + mail-server (MX) check otherwise."""
+    """Check if an email is real/deliverable. Tries Reoon first (cheaper, high accuracy),
+    then Hunter.io if configured, falls back to a free syntax + mail-server (MX) check otherwise."""
+    reoon_key = os.getenv("REOON_API_KEY")
+    if reoon_key:
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                res = await client.get(
+                    "https://emailverifier.reoon.com/api/v1/verify",
+                    params={"email": email, "key": reoon_key, "mode": "quick"}
+                )
+            if res.status_code == 200:
+                result = res.json()
+                status = result.get("status", "unknown")
+                mapping = {
+                    "safe": "valid",
+                    "invalid": "invalid",
+                    "disabled": "invalid",
+                    "disposable": "invalid",
+                    "spamtrap": "invalid",
+                    "inbox_full": "risky",
+                    "catch_all": "risky",
+                    "role_account": "risky",
+                    "unknown": "unknown"
+                }
+                return {"status": mapping.get(status, "unknown"), "method": "reoon"}
+        except Exception as e:
+            logger.error("Reoon verify error for " + email + ": " + str(e))
+            # fall through to Hunter/basic check below
+
     hunter_key = os.getenv("HUNTER_API_KEY")
     if hunter_key:
         try:
@@ -508,6 +547,93 @@ async def get_scraper_quota(user_id: str) -> dict:
         "remaining": monthly_remaining + bonus
     }
 
+# ── Company website scraper: finds emails businesses have published on their own site ──
+from urllib.parse import urlparse
+from urllib.robotparser import RobotFileParser
+
+EMAIL_PATTERN = _re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
+JUNK_EMAIL_MARKERS = ["example.com", "yourdomain", "sentry.io", "wixpress", "godaddy",
+                      ".png", ".jpg", ".jpeg", ".gif", ".svg", "@2x", "schema.org"]
+
+def is_allowed_by_robots(url: str) -> bool:
+    """Never scrape a page whose robots.txt explicitly disallows it."""
+    try:
+        parsed = urlparse(url)
+        robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
+        rp = RobotFileParser()
+        rp.set_url(robots_url)
+        rp.read()
+        return rp.can_fetch("MailFlowBot", url)
+    except Exception:
+        return True  # if robots.txt is unreadable, default to allowed rather than blocking everything
+
+async def extract_emails_from_page(client, url: str) -> set:
+    if not is_allowed_by_robots(url):
+        return set()
+    try:
+        res = await client.get(
+            url, timeout=8,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; MailFlowBot/1.0; +https://mailflow.app/bot)"}
+        )
+        if res.status_code != 200:
+            return set()
+        found = set(EMAIL_PATTERN.findall(res.text))
+        return {e for e in found if not any(marker in e.lower() for marker in JUNK_EMAIL_MARKERS)}
+    except Exception:
+        return set()
+
+async def scrape_company_websites(niche: str, limit: int) -> list:
+    """Finds business websites for a niche via Google's official Custom Search API,
+    then checks their own published contact pages for emails they've chosen to share."""
+    google_key = os.getenv("GOOGLE_SEARCH_API_KEY")
+    google_cx = os.getenv("GOOGLE_SEARCH_CX")
+    if not google_key or not google_cx:
+        return []
+
+    results = []
+    async with httpx.AsyncClient() as client:
+        try:
+            search_res = await client.get(
+                "https://www.googleapis.com/customsearch/v1",
+                params={"key": google_key, "cx": google_cx, "q": niche + " contact", "num": min(limit, 10)}
+            )
+            items = search_res.json().get("items", [])
+        except Exception as e:
+            logger.error("Google Custom Search failed: " + str(e))
+            return []
+
+        for item in items:
+            site_url = item.get("link")
+            if not site_url:
+                continue
+            parsed = urlparse(site_url)
+            domain = parsed.netloc
+            company_name = (item.get("title") or "").split("|")[0].split("-")[0].strip()
+
+            candidate_urls = [site_url] + [
+                f"{parsed.scheme}://{domain}{path}" for path in ["/contact", "/contact-us", "/about"]
+            ]
+
+            found_emails = set()
+            for u in candidate_urls[:3]:
+                found_emails |= await extract_emails_from_page(client, u)
+                if found_emails:
+                    break
+                await asyncio.sleep(1)  # be polite - don't hammer the same domain
+
+            for email in found_emails:
+                results.append({
+                    "name": "",
+                    "email": email,
+                    "company": company_name,
+                    "website": site_url,
+                    "source": "web_scrape"
+                })
+            if len(results) >= limit:
+                break
+
+    return results
+
 @app.post("/scraper/search")
 async def scrape_emails(data: ScrapeModel, user=Depends(get_current_user)):
     quota = await get_scraper_quota(user.id)
@@ -566,6 +692,13 @@ async def scrape_emails(data: ScrapeModel, user=Depends(get_current_user)):
                         })
         except Exception as e:
             logger.error("Hunter error: " + str(e))
+
+    if len(results) < effective_limit:
+        try:
+            web_results = await scrape_company_websites(data.niche, effective_limit - len(results))
+            results.extend(web_results)
+        except Exception as e:
+            logger.error("Website scraper error: " + str(e))
 
     seen = set()
     unique = []
@@ -769,6 +902,11 @@ async def get_sent(user=Depends(get_current_user)):
     result = supabase_admin.table("emails_sent").select("*").eq("user_id", user.id).order("sent_at", desc=True).limit(100).execute()
     return result.data
 
+@app.delete("/inbox/sent/{email_id}")
+async def delete_sent_email(email_id: str, user=Depends(get_current_user)):
+    supabase_admin.table("emails_sent").delete().eq("id", email_id).eq("user_id", user.id).execute()
+    return {"message": "Deleted"}
+
 @app.post("/gmail/check-replies")
 async def check_replies(user=Depends(get_current_user)):
     sent_rows = supabase_admin.table("emails_sent").select("*").eq(
@@ -867,6 +1005,11 @@ async def mark_read(reply_id: str, user=Depends(get_current_user)):
     supabase_admin.table("replies").update({"is_read": True}).eq("id", reply_id).eq("user_id", user.id).execute()
     return {"message": "Marked as read"}
 
+@app.delete("/inbox/replies/{reply_id}")
+async def delete_reply(reply_id: str, user=Depends(get_current_user)):
+    supabase_admin.table("replies").delete().eq("id", reply_id).eq("user_id", user.id).execute()
+    return {"message": "Deleted"}
+
 @app.get("/track/{tracking_id}")
 async def track_open(tracking_id: str):
     try:
@@ -890,6 +1033,28 @@ class AnnouncementModel(BaseModel):
 async def get_announcements(user=Depends(get_current_user)):
     result = supabase_admin.table("announcements").select("*").order("created_at", desc=True).limit(30).execute()
     return result.data or []
+
+@app.post("/admin/announcements/upload")
+async def upload_announcement_media(file: UploadFile = File(...), user=Depends(require_admin)):
+    try:
+        contents = await file.read()
+        max_size = 20 * 1024 * 1024  # 20MB cap
+        if len(contents) > max_size:
+            raise HTTPException(status_code=400, detail="File too large - max 20MB")
+
+        ext = (file.filename or "upload").split(".")[-1].lower()
+        file_path = f"{uuid.uuid4()}.{ext}"
+
+        supabase_admin.storage.from_("announcement-media").upload(
+            file_path, contents, {"content-type": file.content_type or "application/octet-stream"}
+        )
+        public_url = supabase_admin.storage.from_("announcement-media").get_public_url(file_path)
+        media_type = "video" if (file.content_type or "").startswith("video") else "image"
+        return {"url": public_url, "media_type": media_type}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Upload failed: " + str(e))
 
 @app.post("/admin/announcements")
 async def create_announcement(data: AnnouncementModel, user=Depends(require_admin)):
@@ -1001,6 +1166,73 @@ class BuyCreditsModel(BaseModel):
 async def get_credit_packs():
     return CREDIT_PACKS
 
+# ── Findymail "In-Depth Search" - pay for exactly the quantity you want, not fixed packs ──
+def get_findymail_price_per_credit(currency: str) -> float:
+    """Real Findymail cost + 2% margin. Update FINDYMAIL_COST_PER_CREDIT_USD once you know
+    which of their plans you're actually on (Basic=$0.049, Starter=$0.0198, Business=$0.0166)."""
+    base_cost_usd = float(os.getenv("FINDYMAIL_COST_PER_CREDIT_USD", "0.049"))
+    price_usd = base_cost_usd * 1.02  # 2% margin
+    if currency == "NGN":
+        ngn_rate = float(os.getenv("USD_TO_NGN_RATE", "1600"))
+        return round(price_usd * ngn_rate, 2)
+    return round(price_usd, 4)
+
+@app.get("/payments/indepth-search-price")
+async def get_indepth_price():
+    return {
+        "price_per_credit_usd": get_findymail_price_per_credit("USD"),
+        "price_per_credit_ngn": get_findymail_price_per_credit("NGN"),
+        "min_credits": 10
+    }
+
+class BuyIndepthModel(BaseModel):
+    quantity: int
+    currency: str
+
+@app.post("/payments/buy-indepth-search")
+async def buy_indepth_search(data: BuyIndepthModel, user=Depends(get_current_user)):
+    if data.quantity < 10:
+        raise HTTPException(status_code=400, detail="Minimum purchase is 10 credits")
+    if data.currency not in ["NGN", "USD"]:
+        raise HTTPException(status_code=400, detail="Invalid currency")
+
+    price_per_credit = get_findymail_price_per_credit(data.currency)
+    total = round(price_per_credit * data.quantity, 2)
+    amount_smallest_unit = int(total * 100)  # Paystack wants kobo/cents
+
+    secret_key = os.getenv("PAYSTACK_SECRET_KEY")
+    frontend_url = os.getenv("FRONTEND_URL", "https://stellular-panda-334622.netlify.app")
+    try:
+        async with httpx.AsyncClient() as client:
+            res = await client.post(
+                "https://api.paystack.co/transaction/initialize",
+                headers={"Authorization": "Bearer " + secret_key, "Content-Type": "application/json"},
+                json={
+                    "email": user.email,
+                    "amount": amount_smallest_unit,
+                    "currency": data.currency,
+                    "metadata": {
+                        "user_id": user.id,
+                        "type": "indepth_search_topup",
+                        "credits": data.quantity,
+                        "currency": data.currency
+                    },
+                    "callback_url": frontend_url
+                }
+            )
+        result = res.json()
+        if result.get("status"):
+            return {
+                "payment_url": result["data"]["authorization_url"],
+                "reference": result["data"]["reference"],
+                "credits": data.quantity,
+                "amount": amount_smallest_unit,
+                "currency": data.currency
+            }
+        raise HTTPException(status_code=400, detail="Payment initiation failed")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
 @app.post("/payments/buy-credits")
 async def buy_credits(data: BuyCreditsModel, user=Depends(get_current_user)):
     if data.pack not in CREDIT_PACKS:
@@ -1092,6 +1324,30 @@ async def verify_payment(reference: str, user=Depends(get_current_user)):
         if result.get("status") and result["data"]["status"] == "success":
             metadata = result["data"].get("metadata", {})
 
+            if metadata.get("type") == "indepth_search_topup":
+                credits = metadata.get("credits", 0)
+                profile = supabase_admin.table("users").select("findymail_credits").eq("id", user.id).single().execute()
+                current_credits = (profile.data or {}).get("findymail_credits") or 0
+                supabase_admin.table("users").update({
+                    "findymail_credits": current_credits + credits
+                }).eq("id", user.id).execute()
+                try:
+                    supabase_admin.table("payments").insert({
+                        "user_id": user.id,
+                        "plan": "indepth_search_topup",
+                        "amount": result["data"]["amount"],
+                        "currency": result["data"]["currency"],
+                        "reference": reference,
+                        "status": "success"
+                    }).execute()
+                except Exception:
+                    pass
+                return {
+                    "message": f"✅ {credits} in-depth search credits added!",
+                    "credits_added": credits,
+                    "new_balance": current_credits + credits
+                }
+
             if metadata.get("type") == "credit_topup":
                 credits = metadata.get("credits", 0)
                 profile = supabase_admin.table("users").select("scraper_bonus_credits").eq("id", user.id).single().execute()
@@ -1168,6 +1424,15 @@ async def paystack_webhook(request: Request):
             data = event["data"]
             metadata = data.get("metadata", {})
             user_id = metadata.get("user_id")
+
+            if metadata.get("type") == "indepth_search_topup" and user_id:
+                credits = metadata.get("credits", 0)
+                profile = supabase_admin.table("users").select("findymail_credits").eq("id", user_id).single().execute()
+                current_credits = (profile.data or {}).get("findymail_credits") or 0
+                supabase_admin.table("users").update({
+                    "findymail_credits": current_credits + credits
+                }).eq("id", user_id).execute()
+                return {"status": "ok"}
 
             if metadata.get("type") == "credit_topup" and user_id:
                 credits = metadata.get("credits", 0)
