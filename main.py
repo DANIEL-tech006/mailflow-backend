@@ -583,27 +583,27 @@ async def extract_emails_from_page(client, url: str) -> set:
         return set()
 
 async def scrape_company_websites(niche: str, limit: int) -> list:
-    """Finds business websites for a niche via Google's official Custom Search API,
+    """Finds business websites for a niche via Tavily's search API,
     then checks their own published contact pages for emails they've chosen to share."""
-    google_key = os.getenv("GOOGLE_SEARCH_API_KEY")
-    google_cx = os.getenv("GOOGLE_SEARCH_CX")
-    if not google_key or not google_cx:
+    tavily_key = os.getenv("TAVILY_API_KEY")
+    if not tavily_key:
         return []
 
     results = []
     async with httpx.AsyncClient() as client:
         try:
-            search_res = await client.get(
-                "https://www.googleapis.com/customsearch/v1",
-                params={"key": google_key, "cx": google_cx, "q": niche + " contact", "num": min(limit, 10)}
+            search_res = await client.post(
+                "https://api.tavily.com/search",
+                headers={"Authorization": "Bearer " + tavily_key, "Content-Type": "application/json"},
+                json={"query": niche + " contact", "max_results": min(limit, 10), "search_depth": "basic"}
             )
-            items = search_res.json().get("items", [])
+            items = search_res.json().get("results", [])
         except Exception as e:
-            logger.error("Google Custom Search failed: " + str(e))
+            logger.error("Tavily search failed: " + str(e))
             return []
 
         for item in items:
-            site_url = item.get("link")
+            site_url = item.get("url")
             if not site_url:
                 continue
             parsed = urlparse(site_url)
