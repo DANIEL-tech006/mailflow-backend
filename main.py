@@ -643,62 +643,14 @@ async def scrape_emails(data: ScrapeModel, user=Depends(get_current_user)):
             detail=f"Scraper limit reached ({quota['used']}/{quota['limit']} this month). Upgrade your plan to scrape more contacts."
         )
 
-    # Never request more than what's actually left on the plan — this is what
-    # actually protects real Hunter/Apollo credit spend, since they charge
-    # per email returned, not per email saved.
-    effective_limit = min(data.limit, quota["remaining"])
-
-    results = []
-    apollo_key = os.getenv("APOLLO_API_KEY")
-    if apollo_key:
-        try:
-            async with httpx.AsyncClient(timeout=15) as client:
-                res = await client.post(
-                    "https://api.apollo.io/v1/mixed_people/search",
-                    headers={"Content-Type": "application/json"},
-                    json={"api_key": apollo_key, "q_keywords": data.niche, "per_page": effective_limit, "page": 1}
-                )
-                if res.status_code == 200:
-                    for p in res.json().get("people", []):
-                        email = p.get("email")
-                        if email and "@" in email:
-                            results.append({
-                                "name": (p.get("first_name", "") + " " + p.get("last_name", "")).strip(),
-                                "email": email,
-                                "company": p.get("organization", {}).get("name", ""),
-                                "website": p.get("organization", {}).get("website_url", ""),
-                                "source": "apollo"
-                            })
-        except Exception as e:
-            logger.error("Apollo error: " + str(e))
-
-    hunter_key = os.getenv("HUNTER_API_KEY")
-    if hunter_key and len(results) < effective_limit:
-        try:
-            async with httpx.AsyncClient(timeout=15) as client:
-                res = await client.get(
-                    "https://api.hunter.io/v2/domain-search",
-                    params={"domain": data.niche.replace(" ", ""), "api_key": hunter_key, "limit": effective_limit - len(results)}
-                )
-                if res.status_code == 200:
-                    rjson = res.json()
-                    for e in rjson.get("data", {}).get("emails", []):
-                        results.append({
-                            "name": (e.get("first_name", "") + " " + e.get("last_name", "")).strip(),
-                            "email": e.get("value"),
-                            "company": rjson.get("data", {}).get("organization", ""),
-                            "website": "",
-                            "source": "hunter"
-                        })
-        except Exception as e:
-            logger.error("Hunter error: " + str(e))
-
-    if len(results) < effective_limit:
-        try:
-            web_results = await scrape_company_websites(data.niche, effective_limit - len(results))
-            results.extend(web_results)
-        except Exception as e:
-            logger.error("Website scraper error: " + str(e))
+    # Tavily bills per search query, not per result returned - so unlike the old
+    # Hunter/Apollo model, we don't need to cap the result count to protect spend.
+    # One search = one credit, regardless of how many emails come back.
+    try:
+        results = await scrape_company_websites(data.niche, data.limit)
+    except Exception as e:
+        logger.error("Website scraper error: " + str(e))
+        results = []
 
     seen = set()
     unique = []
@@ -707,21 +659,18 @@ async def scrape_emails(data: ScrapeModel, user=Depends(get_current_user)):
             seen.add(r["email"])
             unique.append(r)
 
-    # Count against the plan's quota based on what was actually fetched (real credits spent).
-    # Draw from the monthly allowance first, then bonus (top-up) credits.
-    new_used = quota["used"]
-    new_bonus = quota["bonus_credits"]
-    if unique:
-        spend = len(unique)
-        monthly_remaining = max(quota["limit"] - quota["used"], 0)
-        spend_from_monthly = min(spend, monthly_remaining)
-        spend_from_bonus = spend - spend_from_monthly
-        new_used = quota["used"] + spend_from_monthly
-        new_bonus = max(quota["bonus_credits"] - spend_from_bonus, 0)
-        supabase_admin.table("users").update({
-            "scraper_used_this_month": new_used,
-            "scraper_bonus_credits": new_bonus
-        }).eq("id", user.id).execute()
+    # One search = one credit spent, regardless of how many emails were found.
+    monthly_remaining = max(quota["limit"] - quota["used"], 0)
+    if monthly_remaining > 0:
+        new_used = quota["used"] + 1
+        new_bonus = quota["bonus_credits"]
+    else:
+        new_used = quota["used"]
+        new_bonus = max(quota["bonus_credits"] - 1, 0)
+    supabase_admin.table("users").update({
+        "scraper_used_this_month": new_used,
+        "scraper_bonus_credits": new_bonus
+    }).eq("id", user.id).execute()
 
     return {
         "results": unique,
@@ -825,7 +774,11 @@ async def send_campaign(campaign_id: str, background_tasks: BackgroundTasks, use
         raise HTTPException(status_code=400, detail="No SMTP accounts found. Add one in SMTP Settings first.")
     contacts_query = supabase_admin.table("scraped_contacts").select("*").eq("user_id", user.id)
     if camp.data.get("niche"):
-        contacts_query = contacts_query.eq("niche", camp.data["niche"])
+        niche_list = [n.strip() for n in camp.data["niche"].split(",") if n.strip()]
+        if len(niche_list) == 1:
+            contacts_query = contacts_query.eq("niche", niche_list[0])
+        elif len(niche_list) > 1:
+            contacts_query = contacts_query.in_("niche", niche_list)
     contacts = contacts_query.execute()
     contacts.data = [c for c in (contacts.data or []) if c.get("verification_status") != "invalid"]
     if not contacts.data:
@@ -1770,6 +1723,51 @@ class GmailSendModel(BaseModel):
     body: str
     from_name: str = None
 
+class GenerateEmailModel(BaseModel):
+    context: str
+    tone: Optional[str] = "professional"
+
+@app.post("/ai/generate-email")
+async def generate_email(data: GenerateEmailModel, user=Depends(get_current_user)):
+    gemini_key = os.getenv("GEMINI_API_KEY")
+    if not gemini_key:
+        raise HTTPException(status_code=400, detail="AI writing assistant isn't set up yet - add GEMINI_API_KEY in Railway.")
+
+    system_prompt = (
+        "You are an expert cold email copywriter. Write a short, human-sounding cold outreach email "
+        "based on the user's description. Keep it concise (under 120 words), warm but professional, "
+        "no corporate jargon, no excessive exclamation points, no placeholder brackets left unfilled "
+        "unless they're meant as personalization tags like {{name}} or {{company}}. "
+        "Respond ONLY in this exact format, nothing else, no preamble:\n"
+        "SUBJECT: <subject line>\n"
+        "BODY: <email body>"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            res = await client.post(
+                "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+                headers={"x-goog-api-key": gemini_key, "Content-Type": "application/json"},
+                json={
+                    "contents": [
+                        {"parts": [{"text": system_prompt + "\n\nTone: " + data.tone + ". Context: " + data.context}]}
+                    ]
+                }
+            )
+        if res.status_code != 200:
+            raise HTTPException(status_code=400, detail="AI generation failed: " + res.text[:200])
+
+        content = res.json()["candidates"][0]["content"]["parts"][0]["text"]
+        subject, body = "", content.strip()
+        if "SUBJECT:" in content and "BODY:" in content:
+            subject = content.split("SUBJECT:")[1].split("BODY:")[0].strip()
+            body = content.split("BODY:")[1].strip()
+
+        return {"subject": subject, "body": body}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="AI generation error: " + str(e))
+
 @app.post("/gmail/send")
 async def gmail_send(data: GmailSendModel, user=Depends(get_current_user)):
     account_rec = supabase_admin.table("gmail_accounts").select("*").eq(
@@ -1870,7 +1868,11 @@ async def send_gmail_campaign(
 
     contacts_query = supabase_admin.table("scraped_contacts").select("*").eq("user_id", user.id)
     if camp.data.get("niche"):
-        contacts_query = contacts_query.eq("niche", camp.data["niche"])
+        niche_list = [n.strip() for n in camp.data["niche"].split(",") if n.strip()]
+        if len(niche_list) == 1:
+            contacts_query = contacts_query.eq("niche", niche_list[0])
+        elif len(niche_list) > 1:
+            contacts_query = contacts_query.in_("niche", niche_list)
     contacts = contacts_query.execute()
     contacts.data = [c for c in (contacts.data or []) if c.get("verification_status") != "invalid"]
     if not contacts.data:
