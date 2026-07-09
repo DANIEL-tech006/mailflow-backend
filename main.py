@@ -38,6 +38,32 @@ supabase_admin: Client = create_client(
     os.getenv("SUPABASE_SERVICE_KEY")
 )
 
+async def send_resend_email(to_email: str, subject: str, html: str):
+    """Sends a transactional email via Resend's API. Fails silently (logs only) -
+    this must never break the calling endpoint (registration, etc)."""
+    resend_key = os.getenv("RESEND_API_KEY")
+    if not resend_key:
+        logger.info("RESEND_API_KEY not set - skipping email: " + subject)
+        return False
+    from_addr = os.getenv("RESEND_FROM_EMAIL", "MailFlow <onboarding@resend.dev>")
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            res = await client.post(
+                "https://api.resend.com/emails",
+                headers={
+                    "Authorization": "Bearer " + resend_key,
+                    "Content-Type": "application/json"
+                },
+                json={"from": from_addr, "to": [to_email], "subject": subject, "html": html}
+            )
+        if res.status_code >= 400:
+            logger.error("Resend send failed (" + str(res.status_code) + "): " + res.text[:300])
+            return False
+        return True
+    except Exception as e:
+        logger.error("Resend send error: " + str(e))
+        return False
+
 security = HTTPBearer()
 
 def get_cipher():
@@ -175,6 +201,18 @@ async def register(data: RegisterModel):
                 }).execute()
             except Exception:
                 pass
+            try:
+                welcome_html = (
+                    "<div style='font-family:sans-serif;max-width:480px;margin:0 auto'>"
+                    "<h2 style='color:#00d4aa'>Welcome to MailFlow, " + (data.full_name or "there") + "!</h2>"
+                    "<p>Your account is ready. First, confirm your email using the link we just sent "
+                    "from Supabase, then log in and connect your Gmail account to start sending campaigns.</p>"
+                    "<p style='color:#8b949e;font-size:13px'>If you didn't sign up for MailFlow, you can ignore this email.</p>"
+                    "</div>"
+                )
+                await send_resend_email(data.email, "Welcome to MailFlow", welcome_html)
+            except Exception as e:
+                logger.error("Welcome email failed: " + str(e))
             return {"message": "Account created. Check your email to verify.", "user_id": res.user.id}
         raise HTTPException(status_code=400, detail="Registration failed")
     except Exception as e:
@@ -1729,6 +1767,17 @@ class GenerateEmailModel(BaseModel):
 
 @app.post("/ai/generate-email")
 async def generate_email(data: GenerateEmailModel, user=Depends(get_current_user)):
+    try:
+        profile = supabase_admin.table("users").select("plan").eq("id", user.id).single().execute()
+        plan = (profile.data.get("plan") or "free").lower() if profile.data else "free"
+    except Exception:
+        plan = "free"
+    if plan == "free":
+        raise HTTPException(
+            status_code=403,
+            detail="AI email writing is a Personal/Corporate plan feature. Upgrade in Plan & Billing to use it."
+        )
+
     gemini_key = os.getenv("GEMINI_API_KEY")
     if not gemini_key:
         raise HTTPException(status_code=400, detail="AI writing assistant isn't set up yet - add GEMINI_API_KEY in Railway.")
@@ -1745,7 +1794,7 @@ async def generate_email(data: GenerateEmailModel, user=Depends(get_current_user
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             res = await client.post(
-                "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+                "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent",
                 headers={"x-goog-api-key": gemini_key, "Content-Type": "application/json"},
                 json={
                     "contents": [
@@ -1767,6 +1816,67 @@ async def generate_email(data: GenerateEmailModel, user=Depends(get_current_user
         raise
     except Exception as e:
         raise HTTPException(status_code=400, detail="AI generation error: " + str(e))
+
+class FaqChatModel(BaseModel):
+    message: str
+    history: Optional[List[dict]] = None
+
+FAQ_SYSTEM_PROMPT = (
+    "You are the in-app support assistant for MailFlow, a cold email SaaS platform. "
+    "Answer the user's question directly and briefly (2-5 sentences unless they ask for more detail). "
+    "You can help with two kinds of questions: (1) how to use MailFlow itself, and (2) general "
+    "cold email writing / outreach strategy advice.\n\n"
+    "Facts about MailFlow you can rely on:\n"
+    "- Users connect their own Gmail account via OAuth (Settings > SMTP Settings) - MailFlow sends "
+    "through that Gmail account, not its own servers.\n"
+    "- Plans: Free (100 emails/day, 500 contacts, 4 scraper searches/month, no AI), "
+    "Personal ($4/N6,500 - 1,200 emails/day, 20,000 contacts, 100 scraper searches/month, AI personalization), "
+    "Corporate ($15/N24,000 - 4,500 emails/day, 100,000 contacts, 600 scraper searches/month, AI + auto follow-ups).\n"
+    "- Contacts can be added manually, pasted in bulk, or found with the Email Scraper (searches company "
+    "websites for public business emails).\n"
+    "- Email verification checks if an address is real/deliverable before you send to it.\n"
+    "- Campaigns can target a specific contact group/niche, and send from multiple connected Gmail accounts "
+    "which auto-rotate when one hits its daily limit.\n"
+    "- Sent Emails and Replies are kept for 90 days then automatically deleted.\n"
+    "- Replies only shows genuine replies to emails that were sent through MailFlow via a connected Gmail "
+    "account - it does not read your whole Gmail inbox.\n"
+    "- The '✨ Generate with AI' button drafts a subject and body from a short description.\n\n"
+    "If you don't know the answer, say so honestly and suggest they contact support. "
+    "Never make up pricing, limits, or features not listed above."
+)
+
+@app.post("/ai/faq-chat")
+async def faq_chat(data: FaqChatModel, user=Depends(get_current_user)):
+    gemini_key = os.getenv("GEMINI_API_KEY")
+    if not gemini_key:
+        raise HTTPException(status_code=400, detail="Chat assistant isn't set up yet - add GEMINI_API_KEY in Railway.")
+
+    contents = []
+    for turn in (data.history or [])[-10:]:
+        role = "user" if turn.get("role") == "user" else "model"
+        text = turn.get("text", "")
+        if text:
+            contents.append({"role": role, "parts": [{"text": text}]})
+    contents.append({"role": "user", "parts": [{"text": data.message}]})
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            res = await client.post(
+                "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent",
+                headers={"x-goog-api-key": gemini_key, "Content-Type": "application/json"},
+                json={
+                    "system_instruction": {"parts": [{"text": FAQ_SYSTEM_PROMPT}]},
+                    "contents": contents
+                }
+            )
+        if res.status_code != 200:
+            raise HTTPException(status_code=400, detail="Chat failed: " + res.text[:200])
+        reply = res.json()["candidates"][0]["content"]["parts"][0]["text"]
+        return {"reply": reply.strip()}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Chat error: " + str(e))
 
 @app.post("/gmail/send")
 async def gmail_send(data: GmailSendModel, user=Depends(get_current_user)):
