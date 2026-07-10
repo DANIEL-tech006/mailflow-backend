@@ -1147,9 +1147,33 @@ async def admin_stats(user=Depends(require_admin)):
     revenue_usd = plan_counts.get("personal", 0) * PLANS["personal"]["amount_usd"] / 100 + \
                   plan_counts.get("corporate", 0) * PLANS["corporate"]["amount_usd"] / 100
 
+    # One-off revenue: scraper credit top-ups and in-depth-search (Findymail) top-ups.
+    # These are real, already-collected payments and were previously left out of the
+    # revenue total entirely - only recurring plan subscriptions were counted.
+    topup_ngn = 0
+    topup_usd = 0
+    try:
+        current_month_start = datetime.utcnow().strftime("%Y-%m-01")
+        topup_payments = supabase_admin.table("payments").select(
+            "amount, currency, plan, status, created_at"
+        ).eq("status", "success").gte("created_at", current_month_start).execute()
+        for p in (topup_payments.data or []):
+            ptype = (p.get("plan") or "")
+            if ptype.startswith("credit_topup") or ptype.startswith("indepth_search"):
+                amt = (p.get("amount") or 0) / 100
+                if (p.get("currency") or "NGN").upper() == "NGN":
+                    topup_ngn += amt
+                else:
+                    topup_usd += amt
+    except Exception as e:
+        logger.error("admin_stats topup revenue query failed: " + str(e))
+
+    revenue_ngn += topup_ngn
+    revenue_usd += topup_usd
+
     max_possible_credits = plan_counts.get("free", 0) * 4 + \
                             plan_counts.get("personal", 0) * 100 + \
-                            plan_counts.get("corporate", 0) * 600
+                            plan_counts.get("corporate", 0) * 500
 
     try:
         total_contacts = supabase_admin.table("scraped_contacts").select("id", count="exact").execute()
