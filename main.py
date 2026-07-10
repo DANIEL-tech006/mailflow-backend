@@ -459,26 +459,33 @@ async def verify_single_email(email: str) -> dict:
     reoon_key = os.getenv("REOON_API_KEY")
     if reoon_key:
         try:
-            async with httpx.AsyncClient(timeout=15) as client:
+            async with httpx.AsyncClient(timeout=20) as client:
                 res = await client.get(
                     "https://emailverifier.reoon.com/api/v1/verify",
-                    params={"email": email, "key": reoon_key, "mode": "quick"}
+                    params={"email": email, "key": reoon_key, "mode": "power"}
                 )
             if res.status_code == 200:
                 result = res.json()
                 status = result.get("status", "unknown")
-                mapping = {
-                    "safe": "valid",
-                    "invalid": "invalid",
-                    "disabled": "invalid",
-                    "disposable": "invalid",
-                    "spamtrap": "invalid",
-                    "inbox_full": "risky",
-                    "catch_all": "risky",
-                    "role_account": "risky",
-                    "unknown": "unknown"
-                }
-                return {"status": mapping.get(status, "unknown"), "method": "reoon"}
+                if status == "error":
+                    logger.error("Reoon returned an ERROR (not unknown) for " + email + ": " + str(result.get("reason", result)))
+                    # this is a real API problem (bad key/no credits/bad request), not a genuine
+                    # "we don't know" result - fall through to Hunter/basic instead of lying
+                else:
+                    mapping = {
+                        "safe": "valid",
+                        "invalid": "invalid",
+                        "disabled": "invalid",
+                        "disposable": "invalid",
+                        "spamtrap": "invalid",
+                        "inbox_full": "risky",
+                        "catch_all": "risky",
+                        "role_account": "risky",
+                        "unknown": "unknown"
+                    }
+                    return {"status": mapping.get(status, "unknown"), "method": "reoon"}
+            else:
+                logger.error("Reoon HTTP " + str(res.status_code) + " for " + email + ": " + res.text[:300])
         except Exception as e:
             logger.error("Reoon verify error for " + email + ": " + str(e))
             # fall through to Hunter/basic check below
