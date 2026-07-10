@@ -16,7 +16,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="MailFlow API", version="2.0.0")
+app = FastAPI(title="MailFlows API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -45,7 +45,7 @@ async def send_resend_email(to_email: str, subject: str, html: str):
     if not resend_key:
         logger.info("RESEND_API_KEY not set - skipping email: " + subject)
         return False
-    from_addr = os.getenv("RESEND_FROM_EMAIL", "MailFlow <onboarding@resend.dev>")
+    from_addr = os.getenv("RESEND_FROM_EMAIL", "MailFlows <onboarding@resend.dev>")
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             res = await client.post(
@@ -126,7 +126,7 @@ class CampaignModel(BaseModel):
 class SendTestModel(BaseModel):
     smtp_id: str
     to_email: str
-    subject: str = "Test Email from MailFlow"
+    subject: str = "Test Email from MailFlows"
 
 class ScrapeModel(BaseModel):
     niche: str
@@ -171,7 +171,7 @@ PLANS = {
 
 @app.get("/")
 def root():
-    return {"message": "MailFlow API v2.0 running", "status": "ok"}
+    return {"message": "MailFlows API v2.0 running", "status": "ok"}
 
 @app.get("/ping")
 def ping():
@@ -204,13 +204,13 @@ async def register(data: RegisterModel):
             try:
                 welcome_html = (
                     "<div style='font-family:sans-serif;max-width:480px;margin:0 auto'>"
-                    "<h2 style='color:#00d4aa'>Welcome to MailFlow, " + (data.full_name or "there") + "!</h2>"
+                    "<h2 style='color:#00d4aa'>Welcome to MailFlows, " + (data.full_name or "there") + "!</h2>"
                     "<p>Your account is ready. First, confirm your email using the link we just sent "
                     "from Supabase, then log in and connect your Gmail account to start sending campaigns.</p>"
-                    "<p style='color:#8b949e;font-size:13px'>If you didn't sign up for MailFlow, you can ignore this email.</p>"
+                    "<p style='color:#8b949e;font-size:13px'>If you didn't sign up for MailFlows, you can ignore this email.</p>"
                     "</div>"
                 )
-                await send_resend_email(data.email, "Welcome to MailFlow", welcome_html)
+                await send_resend_email(data.email, "Welcome to MailFlows", welcome_html)
             except Exception as e:
                 logger.error("Welcome email failed: " + str(e))
             return {"message": "Account created. Check your email to verify.", "user_id": res.user.id}
@@ -366,7 +366,7 @@ async def test_smtp(data: SendTestModel, user=Depends(get_current_user)):
         msg["Subject"] = data.subject
         msg["From"] = rec["email"]
         msg["To"] = data.to_email
-        html = "<h2 style='color:#00d4aa'>MailFlow Test Email</h2><p>Your SMTP is configured correctly!</p>"
+        html = "<h2 style='color:#00d4aa'>MailFlows Test Email</h2><p>Your SMTP is configured correctly!</p>"
         msg.attach(MIMEText(html, "html"))
         context = ssl.create_default_context()
         with smtplib.SMTP(rec["host"], rec["port"], timeout=15) as server:
@@ -601,7 +601,7 @@ def is_allowed_by_robots(url: str) -> bool:
         rp = RobotFileParser()
         rp.set_url(robots_url)
         rp.read()
-        return rp.can_fetch("MailFlowBot", url)
+        return rp.can_fetch("MailFlowsBot", url)
     except Exception:
         return True  # if robots.txt is unreadable, default to allowed rather than blocking everything
 
@@ -611,7 +611,7 @@ async def extract_emails_from_page(client, url: str) -> set:
     try:
         res = await client.get(
             url, timeout=8,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; MailFlowBot/1.0; +https://mailflow.app/bot)"}
+            headers={"User-Agent": "Mozilla/5.0 (compatible; MailFlowsBot/1.0; +https://mailflows.org/bot)"}
         )
         if res.status_code != 200:
             return set()
@@ -1751,7 +1751,7 @@ async def send_via_gmail_api(
 class GmailTestModel(BaseModel):
     account_id: str
     to_email: str
-    subject: str = "Test Email from MailFlow"
+    subject: str = "Test Email from MailFlows"
 
 # ── Send single custom email via Gmail API (used by Quick Send) ──
 class GmailSendModel(BaseModel):
@@ -1822,12 +1822,12 @@ class FaqChatModel(BaseModel):
     history: Optional[List[dict]] = None
 
 FAQ_SYSTEM_PROMPT = (
-    "You are the in-app support assistant for MailFlow, a cold email SaaS platform. "
+    "You are the in-app support assistant for MailFlows, a cold email SaaS platform. "
     "Answer the user's question directly and briefly (2-5 sentences unless they ask for more detail). "
-    "You can help with two kinds of questions: (1) how to use MailFlow itself, and (2) general "
+    "You can help with two kinds of questions: (1) how to use MailFlows itself, and (2) general "
     "cold email writing / outreach strategy advice.\n\n"
-    "Facts about MailFlow you can rely on:\n"
-    "- Users connect their own Gmail account via OAuth (Settings > SMTP Settings) - MailFlow sends "
+    "Facts about MailFlows you can rely on:\n"
+    "- Users connect their own Gmail account via OAuth (Settings > SMTP Settings) - MailFlows sends "
     "through that Gmail account, not its own servers.\n"
     "- Plans: Free (100 emails/day, 500 contacts, 4 scraper searches/month, no AI), "
     "Personal ($4/N6,500 - 1,200 emails/day, 20,000 contacts, 100 scraper searches/month, AI personalization), "
@@ -1838,7 +1838,7 @@ FAQ_SYSTEM_PROMPT = (
     "- Campaigns can target a specific contact group/niche, and send from multiple connected Gmail accounts "
     "which auto-rotate when one hits its daily limit.\n"
     "- Sent Emails and Replies are kept for 90 days then automatically deleted.\n"
-    "- Replies only shows genuine replies to emails that were sent through MailFlow via a connected Gmail "
+    "- Replies only shows genuine replies to emails that were sent through MailFlows via a connected Gmail "
     "account - it does not read your whole Gmail inbox.\n"
     "- The '✨ Generate with AI' button drafts a subject and body from a short description.\n\n"
     "If you don't know the answer, say so honestly and suggest they contact support. "
@@ -1941,8 +1941,8 @@ async def test_gmail(data: GmailTestModel, user=Depends(get_current_user)):
             account=account,
             to_email=data.to_email,
             subject=data.subject,
-            html_body="<h2 style='color:#00d4aa'>MailFlow Test Email</h2><p>Your Gmail is connected and working!</p>",
-            plain_body="MailFlow Test Email - Your Gmail is connected and working!",
+            html_body="<h2 style='color:#00d4aa'>MailFlows Test Email</h2><p>Your Gmail is connected and working!</p>",
+            plain_body="MailFlows Test Email - Your Gmail is connected and working!",
         )
         return {"message": "Test email sent successfully to " + data.to_email, "status": "ok"}
     except Exception as e:
