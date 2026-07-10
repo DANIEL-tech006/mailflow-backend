@@ -137,9 +137,9 @@ class InitiatePaymentModel(BaseModel):
     currency: str = "NGN"
 
 CREDIT_PACKS = {
-    "small": {"credits": 10, "amount_ngn": 100000, "amount_usd": 100},   # ₦1,000 / $1.00
-    "medium": {"credits": 50, "amount_ngn": 400000, "amount_usd": 400},  # ₦4,000 / $4.00
-    "large": {"credits": 150, "amount_ngn": 1000000, "amount_usd": 1000} # ₦10,000 / $10.00
+    "small": {"credits": 10, "amount_ngn": 17600, "amount_usd": 11},     # ₦176 / $0.11 - 10 email credits
+    "medium": {"credits": 50, "amount_ngn": 96000, "amount_usd": 60},    # ₦960 / $0.60 - 50 email credits
+    "large": {"credits": 150, "amount_ngn": 320000, "amount_usd": 200}   # ₦3,200 / $2.00 - 150 email credits
 }
 
 PLANS = {
@@ -152,20 +152,18 @@ PLANS = {
         "smtp_limit": 3,
         "scraper_limit": 100,
         "campaigns_limit": 25,
-        "ai_personalization": True,
-        "auto_followup": False
+        "ai_personalization": True
     },
     "corporate": {
         "name": "Corporate",
         "amount_ngn": 2400000,
         "amount_usd": 1500,
         "daily_limit": 4500,
-        "contacts_limit": 100000,
+        "contacts_limit": 70000,
         "smtp_limit": 10,
-        "scraper_limit": 600,
-        "campaigns_limit": 55,
-        "ai_personalization": True,
-        "auto_followup": True
+        "scraper_limit": 500,
+        "campaigns_limit": 50,
+        "ai_personalization": True
     }
 }
 
@@ -314,6 +312,7 @@ async def get_stats(user=Depends(get_current_user)):
         unread = supabase_admin.table("replies").select("id", count="exact").eq("user_id", uid).eq("is_read", False).execute()
 
         quota = await get_scraper_quota(uid)
+        verify_quota = await get_verification_quota(uid)
 
         return {
             "campaigns": campaigns.count or 0,
@@ -323,7 +322,9 @@ async def get_stats(user=Depends(get_current_user)):
             "unread_replies": unread.count or 0,
             "scraper_used": quota["used"],
             "scraper_limit": quota["limit"],
-            "scraper_bonus_credits": quota["bonus_credits"]
+            "scraper_bonus_credits": quota["bonus_credits"],
+            "verification_used": verify_quota["used"],
+            "verification_limit": verify_quota["limit"]
         }
     except Exception:
         return {"campaigns": 0, "contacts": 0, "emails_sent": 0, "replies": 0, "unread_replies": 0, "scraper_used": 0, "scraper_limit": 4}
@@ -527,17 +528,26 @@ class VerifyContactsModel(BaseModel):
 
 @app.post("/contacts/verify")
 async def verify_contacts(data: VerifyContactsModel, user=Depends(get_current_user)):
+    quota = await get_verification_quota(user.id)
+    if quota["remaining"] <= 0:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Verification limit reached ({quota['used']}/{quota['limit']} this month). "
+                   f"This resets monthly and can't be extended with scraper credits - upgrade your plan for more."
+        )
+
     query = supabase_admin.table("scraped_contacts").select("id,email").eq("user_id", user.id)
     if data.contact_ids:
         query = query.in_("id", data.contact_ids)
     else:
         query = query.eq("verification_status", "unverified")
-    contacts = query.limit(50).execute()
+    contacts = query.limit(min(50, quota["remaining"])).execute()
 
     if not contacts.data:
         return {"verified": 0, "results": {}, "message": "No unverified contacts found"}
 
     results = {"valid": 0, "invalid": 0, "risky": 0, "unknown": 0}
+    verified_count = 0
     for c in contacts.data:
         v = await verify_single_email(c["email"])
         status = v["status"]
@@ -547,9 +557,14 @@ async def verify_contacts(data: VerifyContactsModel, user=Depends(get_current_us
             "is_verified": status == "valid",
             "verified_at": datetime.utcnow().isoformat()
         }).eq("id", c["id"]).execute()
+        verified_count += 1
         await asyncio.sleep(0.3)  # gentle pacing to avoid rate limits
 
-    return {"verified": len(contacts.data), "results": results}
+    supabase_admin.table("users").update({
+        "verification_used_this_month": quota["used"] + verified_count
+    }).eq("id", user.id).execute()
+
+    return {"verified": verified_count, "results": results, "verification_remaining": quota["remaining"] - verified_count}
 
 async def get_scraper_quota(user_id: str) -> dict:
     """Returns current scraper usage/limit, resetting the monthly counter if a new month started.
@@ -564,7 +579,7 @@ async def get_scraper_quota(user_id: str) -> dict:
         logger.error("get_scraper_quota query failed for user " + user_id + ": " + str(e))
         profile_data = None
 
-    plan_fallback_limits = {"free": 4, "personal": 100, "corporate": 600}
+    plan_fallback_limits = {"free": 4, "personal": 100, "corporate": 500}
     limit = 4
     used = 0
     bonus = 0
@@ -591,6 +606,39 @@ async def get_scraper_quota(user_id: str) -> dict:
         "bonus_credits": bonus,
         "remaining": monthly_remaining + bonus
     }
+
+async def get_verification_quota(user_id: str) -> dict:
+    """Email verification has its own monthly allowance, sized to match the plan's
+    scraper credit number - but unlike scraping, it can NOT be extended by buying
+    bonus scraper credits. It resets monthly on its own counter."""
+    try:
+        profile = supabase_admin.table("users").select(
+            "plan, scraper_limit, verification_used_this_month, verification_reset_month"
+        ).eq("id", user_id).single().execute()
+        profile_data = profile.data
+    except Exception as e:
+        logger.error("get_verification_quota query failed for user " + user_id + ": " + str(e))
+        profile_data = None
+
+    plan_fallback_limits = {"free": 4, "personal": 100, "corporate": 500}
+    limit = 4
+    used = 0
+    if profile_data:
+        plan = (profile_data.get("plan") or "free").lower()
+        limit = profile_data.get("scraper_limit") or plan_fallback_limits.get(plan, 4)
+        used = profile_data.get("verification_used_this_month") or 0
+        current_month = datetime.utcnow().strftime("%Y-%m")
+        if profile_data.get("verification_reset_month") != current_month:
+            used = 0
+            try:
+                supabase_admin.table("users").update({
+                    "verification_used_this_month": 0,
+                    "verification_reset_month": current_month
+                }).eq("id", user_id).execute()
+            except Exception as e:
+                logger.error("get_verification_quota reset update failed: " + str(e))
+
+    return {"limit": limit, "used": used, "remaining": max(limit - used, 0)}
 
 # ── Company website scraper: finds emails businesses have published on their own site ──
 from urllib.parse import urlparse
@@ -688,9 +736,8 @@ async def scrape_emails(data: ScrapeModel, user=Depends(get_current_user)):
             detail=f"Scraper limit reached ({quota['used']}/{quota['limit']} this month). Upgrade your plan to scrape more contacts."
         )
 
-    # Tavily bills per search query, not per result returned - so unlike the old
-    # Hunter/Apollo model, we don't need to cap the result count to protect spend.
-    # One search = one credit, regardless of how many emails come back.
+    # Tavily itself bills per search query, but we charge users per email actually
+    # found and delivered (not per search) - see the charging logic below.
     try:
         results = await scrape_company_websites(data.niche, data.limit)
     except Exception as e:
@@ -704,14 +751,19 @@ async def scrape_emails(data: ScrapeModel, user=Depends(get_current_user)):
             seen.add(r["email"])
             unique.append(r)
 
-    # One search = one credit spent, regardless of how many emails were found.
+    # One credit = one email address actually found and returned, not one search.
+    # A search that finds nothing costs nothing. Cap results to what the user can
+    # afford (monthly allowance first, then bonus top-up credits).
     monthly_remaining = max(quota["limit"] - quota["used"], 0)
-    if monthly_remaining > 0:
-        new_used = quota["used"] + 1
-        new_bonus = quota["bonus_credits"]
-    else:
-        new_used = quota["used"]
-        new_bonus = max(quota["bonus_credits"] - 1, 0)
+    affordable = monthly_remaining + quota["bonus_credits"]
+    if len(unique) > affordable:
+        unique = unique[:affordable]
+
+    charge = len(unique)
+    from_monthly = min(charge, monthly_remaining)
+    from_bonus = charge - from_monthly
+    new_used = quota["used"] + from_monthly
+    new_bonus = max(quota["bonus_credits"] - from_bonus, 0)
     supabase_admin.table("users").update({
         "scraper_used_this_month": new_used,
         "scraper_bonus_credits": new_bonus
@@ -1151,9 +1203,39 @@ async def delete_user(user_id: str, user=Depends(require_admin)):
 @app.get("/payments/plans")
 async def get_plans():
     return {
-        "free": {"name": "Free", "price_ngn": 0, "price_usd": 0, "daily_limit": 100, "contacts_limit": 500, "smtp_limit": 1, "scraper_limit": 4, "campaigns_limit": 5, "ai_personalization": False, "auto_followup": False, "ads": True},
-        "personal": {"name": "Personal", "price_ngn": 6500, "price_usd": 4, "daily_limit": 1200, "contacts_limit": 20000, "smtp_limit": 3, "scraper_limit": 100, "campaigns_limit": 25, "ai_personalization": True, "auto_followup": False, "ads": False},
-        "corporate": {"name": "Corporate", "price_ngn": 24000, "price_usd": 15, "daily_limit": 4500, "contacts_limit": 100000, "smtp_limit": 10, "scraper_limit": 600, "campaigns_limit": 55, "ai_personalization": True, "auto_followup": True, "ads": False}
+        "free": {"name": "Free", "price_ngn": 0, "price_usd": 0, "daily_limit": 100, "contacts_limit": 500, "smtp_limit": 1, "scraper_limit": 4, "campaigns_limit": 5, "ai_personalization": False, "ads": True},
+        "personal": {"name": "Personal", "price_ngn": 6500, "price_usd": 4, "daily_limit": 1200, "contacts_limit": 20000, "smtp_limit": 3, "scraper_limit": 100, "campaigns_limit": 25, "ai_personalization": True, "ads": False},
+        "corporate": {"name": "Corporate", "price_ngn": 24000, "price_usd": 15, "daily_limit": 4500, "contacts_limit": 70000, "smtp_limit": 10, "scraper_limit": 500, "campaigns_limit": 50, "ai_personalization": True, "ads": False}
+    }
+
+@app.get("/payments/credit-summary")
+async def get_credit_summary(user=Depends(get_current_user)):
+    """Powers the small credit dashboard on the Plan & Billing page: what's left,
+    and a history of what was actually bought."""
+    scraper_quota = await get_scraper_quota(user.id)
+    verify_quota = await get_verification_quota(user.id)
+    try:
+        history = supabase_admin.table("payments").select(
+            "id, plan, amount, currency, status, created_at"
+        ).eq("user_id", user.id).order("created_at", desc=True).limit(20).execute()
+        purchases = history.data or []
+    except Exception as e:
+        logger.error("credit-summary history fetch failed: " + str(e))
+        purchases = []
+
+    return {
+        "scraper": {
+            "monthly_limit": scraper_quota["limit"],
+            "monthly_used": scraper_quota["used"],
+            "monthly_remaining": max(scraper_quota["limit"] - scraper_quota["used"], 0),
+            "bonus_credits": scraper_quota["bonus_credits"]
+        },
+        "verification": {
+            "monthly_limit": verify_quota["limit"],
+            "monthly_used": verify_quota["used"],
+            "monthly_remaining": verify_quota["remaining"]
+        },
+        "purchase_history": purchases
     }
 
 class BuyCreditsModel(BaseModel):
@@ -1836,9 +1918,12 @@ FAQ_SYSTEM_PROMPT = (
     "Facts about MailFlows you can rely on:\n"
     "- Users connect their own Gmail account via OAuth (Settings > SMTP Settings) - MailFlows sends "
     "through that Gmail account, not its own servers.\n"
-    "- Plans: Free (100 emails/day, 500 contacts, 4 scraper searches/month, no AI), "
-    "Personal ($4/N6,500 - 1,200 emails/day, 20,000 contacts, 100 scraper searches/month, AI personalization), "
-    "Corporate ($15/N24,000 - 4,500 emails/day, 100,000 contacts, 600 scraper searches/month, AI + auto follow-ups).\n"
+    "- Plans: Free (100 emails/day, 500 contacts, 4 scraper credits/month, no AI), "
+    "Personal ($4/N6,500 - 1,200 emails/day, 20,000 contacts, 100 scraper credits/month, AI personalization), "
+    "Corporate ($15/N24,000 - 4,500 emails/day, 70,000 contacts, 500 scraper credits/month, AI personalization).\n"
+    "- 1 scraper credit = 1 real email address actually found, not 1 search - searching costs nothing if it finds no results.\n"
+    "- Email verification also has a monthly allowance matching the scraper credit number above, and resets monthly - "
+    "unlike scraping, verification allowance can't be extended by buying bonus credits.\n"
     "- Contacts can be added manually, pasted in bulk, or found with the Email Scraper (searches company "
     "websites for public business emails).\n"
     "- Email verification checks if an address is real/deliverable before you send to it.\n"
