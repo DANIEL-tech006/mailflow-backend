@@ -1045,6 +1045,67 @@ async def check_replies(user=Depends(get_current_user)):
 
     return {"new_replies": new_count}
 
+@app.get("/inbox/replies/{reply_id}/suggested-reply")
+async def suggested_reply(reply_id: str, user=Depends(get_current_user)):
+    """Drafts a suggested follow-up reply. Because the Gmail connection only requests
+    gmail.metadata (headers + snippet, no body - see GMAIL_SCOPES), MailFlow cannot read
+    what the contact actually wrote back. This draft is built from the ORIGINAL outreach
+    email MailFlow already has stored (emails_sent.body), not from the reply's content.
+    The frontend should present this as a starting point to edit, and should recommend
+    opening the real thread in Gmail (which has full body access) as the primary action.
+    """
+    reply = supabase_admin.table("replies").select("*").eq("id", reply_id).eq("user_id", user.id).single().execute()
+    if not reply.data:
+        raise HTTPException(status_code=404, detail="Reply not found")
+    r = reply.data
+
+    original = None
+    if r.get("thread_id"):
+        orig_q = supabase_admin.table("emails_sent").select("subject, body, to_name, to_email").eq(
+            "user_id", user.id
+        ).eq("thread_id", r["thread_id"]).order("sent_at", desc=False).limit(1).execute()
+        if orig_q.data:
+            original = orig_q.data[0]
+
+    contact_name = (r.get("from_name") or "there").split()[0]
+    original_subject = (original or {}).get("subject") or r.get("subject") or "our previous email"
+
+    draft = (
+        f"Hi {contact_name},\n\n"
+        f"Thanks for getting back to me on \"{original_subject}\" - great to hear from you.\n\n"
+        f"[Add your reply here based on what they actually wrote - open the thread in Gmail "
+        f"to read their message, then send from there.]\n\n"
+        f"Best,\n"
+    )
+
+    groq_key = os.getenv("GROQ_API_KEY")
+    ai_generated = False
+    if groq_key and original and original.get("body"):
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=15) as client:
+                gres = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {groq_key}"},
+                    json={
+                        "model": "llama-3.1-8b-instant",
+                        "messages": [
+                            {"role": "system", "content": "Write a short, friendly cold-email follow-up reply draft (under 100 words). You do NOT know what the recipient actually said back - write a generic but warm continuation based only on the original outreach email, and leave a clear placeholder for the sender to fill in specifics from the reply they can only read in Gmail."},
+                            {"role": "user", "content": f"Original outreach email:\nSubject: {original_subject}\nBody: {original.get('body','')[:800]}\n\nRecipient name: {contact_name}"}
+                        ],
+                        "max_tokens": 200
+                    }
+                )
+            if gres.status_code == 200:
+                content = gres.json()["choices"][0]["message"]["content"].strip()
+                if content:
+                    draft = content
+                    ai_generated = True
+        except Exception as e:
+            logger.error("suggested_reply Groq call failed: " + str(e))
+
+    return {"draft": draft, "ai_generated": ai_generated, "note": "Based on your original outreach email, not the reply's actual content (MailFlow's Gmail connection can't read reply bodies)."}
+
 @app.get("/inbox/replies")
 async def get_replies(user=Depends(get_current_user)):
     result = supabase_admin.table("replies").select("*").eq("user_id", user.id).order("received_at", desc=True).execute()
@@ -1223,6 +1284,132 @@ async def delete_user(user_id: str, user=Depends(require_admin)):
         return {"message": "User deleted successfully"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+# ══ SUPPORT TICKETS ══
+# Requires two new Supabase tables (run once in the SQL Editor):
+#
+# create table support_tickets (
+#   id uuid primary key default gen_random_uuid(),
+#   user_id uuid references users(id) on delete cascade,
+#   user_email text,
+#   subject text not null,
+#   status text default 'open',  -- open | answered | closed
+#   created_at timestamptz default now(),
+#   updated_at timestamptz default now()
+# );
+# create table support_messages (
+#   id uuid primary key default gen_random_uuid(),
+#   ticket_id uuid references support_tickets(id) on delete cascade,
+#   sender text not null,  -- 'user' | 'admin'
+#   body text not null,
+#   created_at timestamptz default now()
+# );
+
+class SupportTicketCreate(BaseModel):
+    subject: str
+    message: str
+
+class SupportMessageCreate(BaseModel):
+    message: str
+
+class SupportStatusUpdate(BaseModel):
+    status: str  # open | answered | closed
+
+@app.post("/support/tickets")
+async def create_support_ticket(data: SupportTicketCreate, user=Depends(get_current_user)):
+    ticket = supabase_admin.table("support_tickets").insert({
+        "user_id": user.id,
+        "user_email": user.email,
+        "subject": data.subject.strip()[:200] or "Support request",
+        "status": "open",
+    }).execute()
+    if not ticket.data:
+        raise HTTPException(status_code=500, detail="Could not create ticket")
+    ticket_id = ticket.data[0]["id"]
+    supabase_admin.table("support_messages").insert({
+        "ticket_id": ticket_id,
+        "sender": "user",
+        "body": data.message.strip(),
+    }).execute()
+    return {"id": ticket_id, "message": "Ticket created"}
+
+@app.get("/support/tickets")
+async def list_my_support_tickets(user=Depends(get_current_user)):
+    result = supabase_admin.table("support_tickets").select("*").eq(
+        "user_id", user.id
+    ).order("updated_at", desc=True).execute()
+    return result.data or []
+
+@app.get("/support/tickets/{ticket_id}")
+async def get_support_ticket(ticket_id: str, user=Depends(get_current_user)):
+    ticket = supabase_admin.table("support_tickets").select("*").eq("id", ticket_id).eq("user_id", user.id).single().execute()
+    if not ticket.data:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    messages = supabase_admin.table("support_messages").select("*").eq(
+        "ticket_id", ticket_id
+    ).order("created_at", desc=False).execute()
+    return {"ticket": ticket.data, "messages": messages.data or []}
+
+@app.post("/support/tickets/{ticket_id}/reply")
+async def reply_to_support_ticket(ticket_id: str, data: SupportMessageCreate, user=Depends(get_current_user)):
+    ticket = supabase_admin.table("support_tickets").select("*").eq("id", ticket_id).eq("user_id", user.id).single().execute()
+    if not ticket.data:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    supabase_admin.table("support_messages").insert({
+        "ticket_id": ticket_id, "sender": "user", "body": data.message.strip()
+    }).execute()
+    supabase_admin.table("support_tickets").update({
+        "status": "open", "updated_at": datetime.utcnow().isoformat()
+    }).eq("id", ticket_id).execute()
+    return {"message": "Reply added"}
+
+@app.get("/admin/support-tickets")
+async def admin_list_support_tickets(user=Depends(require_admin)):
+    result = supabase_admin.table("support_tickets").select("*").order("updated_at", desc=True).execute()
+    return result.data or []
+
+@app.get("/admin/support-tickets/{ticket_id}")
+async def admin_get_support_ticket(ticket_id: str, user=Depends(require_admin)):
+    ticket = supabase_admin.table("support_tickets").select("*").eq("id", ticket_id).single().execute()
+    if not ticket.data:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    messages = supabase_admin.table("support_messages").select("*").eq(
+        "ticket_id", ticket_id
+    ).order("created_at", desc=False).execute()
+    return {"ticket": ticket.data, "messages": messages.data or []}
+
+@app.post("/admin/support-tickets/{ticket_id}/reply")
+async def admin_reply_support_ticket(ticket_id: str, data: SupportMessageCreate, user=Depends(require_admin)):
+    ticket = supabase_admin.table("support_tickets").select("*").eq("id", ticket_id).single().execute()
+    if not ticket.data:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    supabase_admin.table("support_messages").insert({
+        "ticket_id": ticket_id, "sender": "admin", "body": data.message.strip()
+    }).execute()
+    supabase_admin.table("support_tickets").update({
+        "status": "answered", "updated_at": datetime.utcnow().isoformat()
+    }).eq("id", ticket_id).execute()
+
+    # Notify the user by email so they aren't just waiting silently in-app.
+    user_email = ticket.data.get("user_email")
+    if user_email:
+        await send_resend_email(
+            user_email,
+            "Reply to your MailFlows support ticket: " + (ticket.data.get("subject") or ""),
+            "<p>Hi,</p><p>We replied to your support ticket:</p>"
+            "<blockquote>" + data.message.strip().replace("\n", "<br>") + "</blockquote>"
+            "<p>Log in to MailFlows and open Support to continue the conversation.</p>"
+        )
+    return {"message": "Reply sent"}
+
+@app.patch("/admin/support-tickets/{ticket_id}/status")
+async def admin_update_support_status(ticket_id: str, data: SupportStatusUpdate, user=Depends(require_admin)):
+    if data.status not in ("open", "answered", "closed"):
+        raise HTTPException(status_code=400, detail="Invalid status")
+    supabase_admin.table("support_tickets").update({
+        "status": data.status, "updated_at": datetime.utcnow().isoformat()
+    }).eq("id", ticket_id).execute()
+    return {"message": "Status updated"}
 
 @app.get("/payments/plans")
 async def get_plans():
@@ -1586,10 +1773,18 @@ FRONTEND_URL = os.getenv("FRONTEND_URL", "https://effervescent-nasturtium-6a71c2
 
 GMAIL_SCOPES = [
     "https://www.googleapis.com/auth/gmail.send",
-    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.metadata",
     "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/userinfo.profile",
 ]
+# NOTE: gmail.metadata is a "Sensitive" scope (free, self-declared verification).
+# gmail.readonly is "Restricted" and requires a paid CASA security assessment.
+# gmail.metadata only allows Gmail API calls with format=metadata (headers + snippet,
+# no full body, no raw MIME). check_replies() below already only ever requested
+# format=metadata, so this scope change requires no change to that function.
+# It DOES mean MailFlow can never fetch a reply's full body via the API - see the
+# reply UI, which is built around that limitation (redirect-to-Gmail as the primary
+# action, since Gmail itself always has full body access).
 
 class GmailAccountLabel(BaseModel):
     label: str = "Gmail"
