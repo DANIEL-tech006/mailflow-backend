@@ -957,6 +957,45 @@ async def delete_sent_email(email_id: str, user=Depends(get_current_user)):
     supabase_admin.table("emails_sent").delete().eq("id", email_id).eq("user_id", user.id).execute()
     return {"message": "Deleted"}
 
+class InboundReplyModel(BaseModel):
+    email_id: str          # the reply+<email_id>@mailflows.org this reply was sent to
+    from_email: str
+    from_name: Optional[str] = None
+    subject: Optional[str] = None
+    text_body: Optional[str] = None
+    html_body: Optional[str] = None
+
+@app.post("/webhooks/inbound-reply")
+async def inbound_reply_webhook(data: InboundReplyModel, request: Request):
+    # Verify this really came from our own Cloudflare Worker, not a random POST from the internet
+    secret = request.headers.get("X-Webhook-Secret", "")
+    expected = os.getenv("INBOUND_WEBHOOK_SECRET", "")
+    if not expected or not hmac.compare_digest(secret, expected):
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+
+    sent = supabase_admin.table("emails_sent").select("user_id, campaign_id, to_email").eq(
+        "id", data.email_id
+    ).single().execute()
+    if not sent.data:
+        # Not necessarily an error - could be an old email from before this system existed,
+        # or a bounce/auto-reply we don't need to keep. Just acknowledge and drop it.
+        logger.info("Inbound reply for unknown email_id " + data.email_id + " - dropped")
+        return {"message": "No matching sent email - dropped"}
+
+    body = data.text_body or data.html_body or ""
+    supabase_admin.table("replies").insert({
+        "user_id": sent.data["user_id"],
+        "campaign_id": sent.data.get("campaign_id"),
+        "from_email": data.from_email,
+        "from_name": data.from_name,
+        "subject": data.subject,
+        "body": body,
+        "is_read": False,
+        "received_at": datetime.utcnow().isoformat()
+    }).execute()
+
+    return {"message": "Reply recorded"}
+
 @app.post("/gmail/check-replies")
 async def check_replies(user=Depends(get_current_user)):
     sent_rows = supabase_admin.table("emails_sent").select("*").eq(
@@ -2234,6 +2273,8 @@ async def gmail_send(data: GmailSendModel, user=Depends(get_current_user)):
         raise HTTPException(status_code=403, detail=plan_check["message"])
 
     html_body = data.body.replace("\n", "<br>")
+    email_id = str(uuid.uuid4())
+    tracking_reply_to = "reply+" + email_id + "@mailflows.org"
 
     try:
         send_result = await send_via_gmail_api(
@@ -2243,8 +2284,10 @@ async def gmail_send(data: GmailSendModel, user=Depends(get_current_user)):
             html_body=html_body,
             plain_body=data.body,
             from_name=data.from_name,
+            reply_to=tracking_reply_to,
         )
         supabase_admin.table("emails_sent").insert({
+            "id": email_id,
             "user_id": user.id,
             "campaign_id": None,
             "to_email": data.to_email,
@@ -2383,6 +2426,12 @@ async def send_bulk_via_gmail(
                         "<br><small>To unsubscribe, reply UNSUBSCRIBE</small>"
             plain_body = body + "\n\nTo unsubscribe reply UNSUBSCRIBE"
 
+            # Every sent email gets its own reply-to address on our own domain
+            # (reply+<email_id>@mailflows.org). This is how replies get matched back
+            # without ever needing to read the user's Gmail inbox.
+            email_id = str(uuid.uuid4())
+            tracking_reply_to = "reply+" + email_id + "@mailflows.org"
+
             send_result = await send_via_gmail_api(
                 account=account,
                 to_email=contact["email"],
@@ -2390,11 +2439,12 @@ async def send_bulk_via_gmail(
                 html_body=html_body,
                 plain_body=plain_body,
                 from_name=campaign.get("from_name"),
-                reply_to=campaign.get("reply_to"),
+                reply_to=tracking_reply_to,
             )
 
             # Log sent email
             supabase_admin.table("emails_sent").insert({
+                "id": email_id,
                 "user_id": user_id,
                 "campaign_id": campaign["id"],
                 "to_email": contact["email"],
