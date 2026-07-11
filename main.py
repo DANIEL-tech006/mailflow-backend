@@ -2156,6 +2156,12 @@ async def generate_email(data: GenerateEmailModel, user=Depends(get_current_user
         "based on the user's description. Keep it concise (under 120 words), warm but professional, "
         "no corporate jargon, no excessive exclamation points, no placeholder brackets left unfilled "
         "unless they're meant as personalization tags like {{name}} or {{company}}. "
+        "IMPORTANT: base the entire email specifically on the details the user gave you - their exact "
+        "industry, offer, and audience. Do not default to generic cold-email boilerplate ('I hope this "
+        "email finds you well', 'I wanted to reach out', etc). Vary your opening line, structure, and "
+        "phrasing every time so it doesn't read like a template - imagine a different real person wrote "
+        "it each time. If the user's description is vague, make a specific, concrete assumption rather "
+        "than writing something generic. "
         "Respond ONLY in this exact format, nothing else, no preamble:\n"
         "SUBJECT: <subject line>\n"
         "BODY: <email body>"
@@ -2168,7 +2174,8 @@ async def generate_email(data: GenerateEmailModel, user=Depends(get_current_user
                 json={
                     "contents": [
                         {"parts": [{"text": system_prompt + "\n\nTone: " + data.tone + ". Context: " + data.context}]}
-                    ]
+                    ],
+                    "generationConfig": {"temperature": 1.0}
                 }
             )
         if res.status_code != 200:
