@@ -1331,6 +1331,17 @@ async def create_support_ticket(data: SupportTicketCreate, user=Depends(get_curr
         "sender": "user",
         "body": data.message.strip(),
     }).execute()
+
+    admin_email = os.getenv("ADMIN_EMAIL")
+    if admin_email:
+        await send_resend_email(
+            admin_email,
+            "New MailFlows support ticket: " + (data.subject.strip()[:100] or "Support request"),
+            "<p>New ticket from <strong>" + user.email + "</strong>:</p>"
+            "<blockquote>" + data.message.strip().replace("\n", "<br>") + "</blockquote>"
+            "<p>Reply from the Admin Dashboard → Support tab.</p>"
+        )
+
     return {"id": ticket_id, "message": "Ticket created"}
 
 @app.get("/support/tickets")
@@ -1361,6 +1372,17 @@ async def reply_to_support_ticket(ticket_id: str, data: SupportMessageCreate, us
     supabase_admin.table("support_tickets").update({
         "status": "open", "updated_at": datetime.utcnow().isoformat()
     }).eq("id", ticket_id).execute()
+
+    admin_email = os.getenv("ADMIN_EMAIL")
+    if admin_email:
+        await send_resend_email(
+            admin_email,
+            "New reply on MailFlows support ticket: " + (ticket.data.get("subject") or ""),
+            "<p><strong>" + user.email + "</strong> replied:</p>"
+            "<blockquote>" + data.message.strip().replace("\n", "<br>") + "</blockquote>"
+            "<p>Reply from the Admin Dashboard → Support tab.</p>"
+        )
+
     return {"message": "Reply added"}
 
 @app.get("/admin/support-tickets")
