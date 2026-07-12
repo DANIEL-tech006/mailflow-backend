@@ -1009,6 +1009,12 @@ async def inbound_reply_webhook(data: InboundReplyModel, request: Request):
         return {"message": "No matching sent email - dropped"}
 
     body = data.text_body or data.html_body or ""
+    logger.info(
+        "Inbound reply received for " + data.email_id +
+        " - text_body len: " + str(len(data.text_body or "")) +
+        ", html_body len: " + str(len(data.html_body or "")) +
+        ", stored body len: " + str(len(body))
+    )
     supabase_admin.table("replies").insert({
         "user_id": sent.data["user_id"],
         "campaign_id": sent.data.get("campaign_id"),
@@ -2187,7 +2193,10 @@ async def generate_email(data: GenerateEmailModel, user=Depends(get_current_user
         "professional, no corporate jargon, no excessive exclamation points. Vary your opening line, "
         "structure, and phrasing so it doesn't read like a rigid template - imagine a different real "
         "person wrote it each time. Avoid dead cliches like 'I hope this email finds you well' or "
-        "'I wanted to reach out'. "
+        "'I wanted to reach out'. Avoid overused AI-sounding buzzwords: streamline, leverage, unlock, "
+        "elevate, seamless, cutting-edge, game-changer, robust, synergy, in today's fast-paced world. "
+        "Use plain, everyday words a real person would actually say out loud. Vary sentence length - "
+        "mix short punchy sentences with longer ones, the way real writing naturally sounds. "
         "Personalization tags like {{name}} or {{company}} may be used only where they make sense for "
         "what was actually asked. "
         "CRITICAL RULE - NEVER INVENT FACTS: only mention details about the recipient, their company, "
