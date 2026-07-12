@@ -2154,12 +2154,17 @@ async def generate_email(data: GenerateEmailModel, user=Depends(get_current_user
         "based on the user's description. Keep it concise (under 120 words), warm but professional, "
         "no corporate jargon, no excessive exclamation points, no placeholder brackets left unfilled "
         "unless they're meant as personalization tags like {{name}} or {{company}}. "
-        "IMPORTANT: base the entire email specifically on the details the user gave you - their exact "
-        "industry, offer, and audience. Do not default to generic cold-email boilerplate ('I hope this "
-        "email finds you well', 'I wanted to reach out', etc). Vary your opening line, structure, and "
-        "phrasing every time so it doesn't read like a template - imagine a different real person wrote "
-        "it each time. If the user's description is vague, make a specific, concrete assumption rather "
-        "than writing something generic. "
+        "Vary your opening line, structure, and phrasing so it doesn't read like a rigid template - "
+        "imagine a different real person wrote it each time. Avoid dead cliches like 'I hope this "
+        "email finds you well' or 'I wanted to reach out'. "
+        "CRITICAL RULE - NEVER INVENT FACTS: only mention details about the recipient, their company, "
+        "their location, their website, or their business that the user's description explicitly states. "
+        "Never guess or make up specifics like where they're based, what they import/export, what their "
+        "website looks like, their industry practices, or anything else not directly given to you. If "
+        "the description is vague or generic, write a genuinely well-crafted GENERIC email instead - "
+        "vary the writing style and voice, not the factual claims. A vague but honest email is always "
+        "correct; a specific but fabricated one is never acceptable, since it will be sent to a real "
+        "person and false claims damage trust and deliverability. "
         "Respond ONLY in this exact format, nothing else, no preamble:\n"
         "SUBJECT: <subject line>\n"
         "BODY: <email body>"
@@ -2254,6 +2259,67 @@ async def faq_chat(data: FaqChatModel, user=Depends(get_current_user)):
         raise
     except Exception as e:
         raise HTTPException(status_code=400, detail="Chat error: " + str(e))
+
+class SendReplyModel(BaseModel):
+    account_id: str
+    to_email: str
+    subject: str
+    body: str
+
+@app.post("/gmail/send-reply")
+async def gmail_send_reply(data: SendReplyModel, user=Depends(get_current_user)):
+    """Sends a reply through MailFlows (not an external Gmail compose window), so it
+    carries its own fresh reply+ tracking address - meaning if the contact replies
+    again, that gets captured too, keeping an ongoing conversation fully visible
+    instead of only ever catching the first reply."""
+    account_rec = supabase_admin.table("gmail_accounts").select("*").eq(
+        "id", data.account_id
+    ).eq("user_id", user.id).single().execute()
+
+    if not account_rec.data:
+        raise HTTPException(status_code=404, detail="Gmail account not found")
+
+    account = account_rec.data
+    account = (await reset_gmail_daily_counts([account]))[0]
+
+    if account["sent_today"] >= account["daily_limit"]:
+        raise HTTPException(
+            status_code=403,
+            detail=f"This Gmail account has hit its daily limit ({account['sent_today']}/{account['daily_limit']}). Connect another account or try again tomorrow."
+        )
+
+    plan_check = await check_plan_daily_limit(user.id)
+    if not plan_check["ok"]:
+        raise HTTPException(status_code=403, detail=plan_check["message"])
+
+    html_body = data.body.replace("\n", "<br>")
+    email_id = str(uuid.uuid4())
+    tracking_reply_to = "reply+" + email_id + "@mailflows.org"
+
+    try:
+        send_result = await send_via_gmail_api(
+            account=account,
+            to_email=data.to_email,
+            subject=data.subject,
+            html_body=html_body,
+            plain_body=data.body,
+            reply_to=tracking_reply_to,
+        )
+        supabase_admin.table("emails_sent").insert({
+            "id": email_id,
+            "user_id": user.id,
+            "campaign_id": None,
+            "to_email": data.to_email,
+            "to_name": None,
+            "subject": data.subject,
+            "body": data.body,
+            "status": "sent",
+            "thread_id": send_result.get("thread_id"),
+            "gmail_account_id": account["id"],
+        }).execute()
+        return {"message": "Reply sent to " + data.to_email, "status": "ok"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Send failed: " + str(e))
 
 @app.post("/gmail/send")
 async def gmail_send(data: GmailSendModel, user=Depends(get_current_user)):
