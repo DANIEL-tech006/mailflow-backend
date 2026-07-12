@@ -838,18 +838,44 @@ async def update_campaign_status(campaign_id: str, data: CampaignStatusUpdate, u
 async def get_campaigns(user=Depends(get_current_user)):
     result = supabase_admin.table("campaigns").select("*").eq("user_id", user.id).order("created_at", desc=True).execute()
     campaigns = result.data or []
+    if not campaigns:
+        return campaigns
+
     # open_count/reply_count on the campaigns table itself are never updated after creation -
-    # compute the real numbers live from emails_sent/replies instead of showing frozen zeros
+    # compute the real numbers live, but in bulk (2 queries total) instead of per-campaign
+    # (which used to be 3 queries x N campaigns - genuinely slow once you have more than a
+    # handful of campaigns, since every one of those was a separate network round-trip).
+    campaign_ids = [c["id"] for c in campaigns]
+    try:
+        sent_rows = supabase_admin.table("emails_sent").select("campaign_id, is_opened").eq(
+            "user_id", user.id
+        ).in_("campaign_id", campaign_ids).execute()
+        reply_rows = supabase_admin.table("replies").select("campaign_id").eq(
+            "user_id", user.id
+        ).in_("campaign_id", campaign_ids).execute()
+    except Exception as e:
+        logger.error("campaign bulk-stats failed: " + str(e))
+        sent_rows = None
+        reply_rows = None
+
+    sent_counts, open_counts, reply_counts = {}, {}, {}
+    for row in ((sent_rows.data if sent_rows else None) or []):
+        cid = row.get("campaign_id")
+        if not cid:
+            continue
+        sent_counts[cid] = sent_counts.get(cid, 0) + 1
+        if row.get("is_opened"):
+            open_counts[cid] = open_counts.get(cid, 0) + 1
+    for row in ((reply_rows.data if reply_rows else None) or []):
+        cid = row.get("campaign_id")
+        if cid:
+            reply_counts[cid] = reply_counts.get(cid, 0) + 1
+
     for camp in campaigns:
-        try:
-            sent = supabase_admin.table("emails_sent").select("id", count="exact").eq("campaign_id", camp["id"]).execute()
-            opened = supabase_admin.table("emails_sent").select("id", count="exact").eq("campaign_id", camp["id"]).eq("is_opened", True).execute()
-            replies = supabase_admin.table("replies").select("id", count="exact").eq("campaign_id", camp["id"]).execute()
-            camp["sent_count"] = sent.count or 0
-            camp["open_count"] = opened.count or 0
-            camp["reply_count"] = replies.count or 0
-        except Exception as e:
-            logger.error("campaign live-stats failed for " + str(camp.get("id")) + ": " + str(e))
+        cid = camp["id"]
+        camp["sent_count"] = sent_counts.get(cid, 0)
+        camp["open_count"] = open_counts.get(cid, 0)
+        camp["reply_count"] = reply_counts.get(cid, 0)
     return campaigns
 
 @app.delete("/campaigns/{campaign_id}")
@@ -2150,21 +2176,26 @@ async def generate_email(data: GenerateEmailModel, user=Depends(get_current_user
         raise HTTPException(status_code=400, detail="AI writing assistant isn't set up yet - add GEMINI_API_KEY in Railway.")
 
     system_prompt = (
-        "You are an expert cold email copywriter. Write a short, human-sounding cold outreach email "
-        "based on the user's description. Keep it concise (under 120 words), warm but professional, "
-        "no corporate jargon, no excessive exclamation points, no placeholder brackets left unfilled "
-        "unless they're meant as personalization tags like {{name}} or {{company}}. "
-        "Vary your opening line, structure, and phrasing so it doesn't read like a rigid template - "
-        "imagine a different real person wrote it each time. Avoid dead cliches like 'I hope this "
-        "email finds you well' or 'I wanted to reach out'. "
+        "You write emails based on the user's description. Follow their instruction LITERALLY and "
+        "proportionally to what they actually asked for. If they ask for something simple - a greeting, "
+        "a short thank-you, a one-line follow-up - write exactly that, short and plain. Do NOT expand a "
+        "simple request into a cold-outreach sales pitch unless the user's description actually describes "
+        "a product, service, offer, or target audience to pitch to. Only write full cold-email-style "
+        "content (introducing yourself, describing what you do, asking about their priorities) when the "
+        "user's description genuinely calls for that. "
+        "When cold-outreach content IS appropriate: keep it concise (under 120 words), warm but "
+        "professional, no corporate jargon, no excessive exclamation points. Vary your opening line, "
+        "structure, and phrasing so it doesn't read like a rigid template - imagine a different real "
+        "person wrote it each time. Avoid dead cliches like 'I hope this email finds you well' or "
+        "'I wanted to reach out'. "
+        "Personalization tags like {{name}} or {{company}} may be used only where they make sense for "
+        "what was actually asked. "
         "CRITICAL RULE - NEVER INVENT FACTS: only mention details about the recipient, their company, "
         "their location, their website, or their business that the user's description explicitly states. "
         "Never guess or make up specifics like where they're based, what they import/export, what their "
-        "website looks like, their industry practices, or anything else not directly given to you. If "
-        "the description is vague or generic, write a genuinely well-crafted GENERIC email instead - "
-        "vary the writing style and voice, not the factual claims. A vague but honest email is always "
-        "correct; a specific but fabricated one is never acceptable, since it will be sent to a real "
-        "person and false claims damage trust and deliverability. "
+        "website looks like, their industry practices, or anything else not directly given to you. A "
+        "vague but honest email is always correct; a specific but fabricated one is never acceptable, "
+        "since it will be sent to a real person and false claims damage trust and deliverability. "
         "Respond ONLY in this exact format, nothing else, no preamble:\n"
         "SUBJECT: <subject line>\n"
         "BODY: <email body>"
@@ -2294,7 +2325,7 @@ async def gmail_send_reply(data: SendReplyModel, user=Depends(get_current_user))
 
     html_body = data.body.replace("\n", "<br>")
     email_id = str(uuid.uuid4())
-    tracking_reply_to = "reply+" + email_id + "@mailflows.org"
+    tracking_reply_to = account["gmail_address"] + ", reply+" + email_id + "@mailflows.org"
 
     try:
         send_result = await send_via_gmail_api(
@@ -2345,7 +2376,7 @@ async def gmail_send(data: GmailSendModel, user=Depends(get_current_user)):
 
     html_body = data.body.replace("\n", "<br>")
     email_id = str(uuid.uuid4())
-    tracking_reply_to = "reply+" + email_id + "@mailflows.org"
+    tracking_reply_to = account["gmail_address"] + ", reply+" + email_id + "@mailflows.org"
 
     try:
         send_result = await send_via_gmail_api(
@@ -2501,7 +2532,7 @@ async def send_bulk_via_gmail(
             # (reply+<email_id>@mailflows.org). This is how replies get matched back
             # without ever needing to read the user's Gmail inbox.
             email_id = str(uuid.uuid4())
-            tracking_reply_to = "reply+" + email_id + "@mailflows.org"
+            tracking_reply_to = account["gmail_address"] + ", reply+" + email_id + "@mailflows.org"
 
             send_result = await send_via_gmail_api(
                 account=account,
