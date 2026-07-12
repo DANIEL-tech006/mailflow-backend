@@ -1073,8 +1073,6 @@ async def check_replies(user=Depends(get_current_user)):
                     "body": msg.get("snippet", ""),
                     "is_read": False,
                     "gmail_message_id": msg_id,
-                    "gmail_account_id": account["id"],
-                    "thread_id": thread_id,
                     "received_at": datetime.utcnow().isoformat(),
                 }).execute()
                 new_count += 1
