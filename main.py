@@ -167,6 +167,30 @@ PLANS = {
     }
 }
 
+FREE_PLAN = {
+    "daily_limit": 100,
+    "contacts_limit": 500,
+    "smtp_limit": 1,
+    "scraper_limit": 4,
+    "campaigns_limit": 5,
+}
+
+@app.post("/payments/downgrade")
+async def downgrade_to_free(user=Depends(get_current_user)):
+    """Self-serve downgrade - no support ticket needed. Takes effect immediately
+    (MVP behavior - if you later want it to wait until the paid period ends,
+    check plan_expires_at here instead of downgrading right away)."""
+    supabase_admin.table("users").update({
+        "plan": "free",
+        "daily_limit": FREE_PLAN["daily_limit"],
+        "contacts_limit": FREE_PLAN["contacts_limit"],
+        "smtp_limit": FREE_PLAN["smtp_limit"],
+        "scraper_limit": FREE_PLAN["scraper_limit"],
+        "campaigns_limit": FREE_PLAN["campaigns_limit"],
+        "plan_expires_at": None,
+    }).eq("id", user.id).execute()
+    return {"message": "You've been moved to the Free plan.", "plan": "free"}
+
 @app.get("/")
 def root():
     return {"message": "MailFlows API v2.0 running", "status": "ok"}
@@ -454,6 +478,37 @@ async def delete_contact(contact_id: str, user=Depends(get_current_user)):
 
 import re as _re
 
+_vendor_health = {"reoon_fail_streak": 0, "reoon_alerted": False,
+                   "tavily_fail_streak": 0, "tavily_alerted": False}
+
+async def _note_vendor_result(vendor: str, ok: bool):
+    """Tracks consecutive failures per external vendor (Reoon, Tavily). After a
+    few in a row, emails ADMIN_EMAIL once (not on every single failure) - this is
+    usually caused by the vendor account running out of paid credits, which
+    otherwise fails silently and just quietly degrades to a worse fallback."""
+    streak_key = vendor + "_fail_streak"
+    alerted_key = vendor + "_alerted"
+    if ok:
+        _vendor_health[streak_key] = 0
+        _vendor_health[alerted_key] = False
+        return
+    _vendor_health[streak_key] += 1
+    if _vendor_health[streak_key] >= 5 and not _vendor_health[alerted_key]:
+        _vendor_health[alerted_key] = True
+        admin_email = os.getenv("ADMIN_EMAIL")
+        if admin_email:
+            try:
+                await send_resend_email(
+                    admin_email,
+                    f"⚠️ {vendor.title()} has failed {_vendor_health[streak_key]} times in a row",
+                    f"<p>{vendor.title()} API calls have failed {_vendor_health[streak_key]} times in a row on MailFlow.</p>"
+                    f"<p>This usually means the {vendor.title()} account is out of credits, the API key is wrong, "
+                    f"or the vendor is down. MailFlow is still working - it's silently falling back to a lower-quality "
+                    f"method - but check your {vendor.title()} dashboard when you can.</p>"
+                )
+            except Exception as e:
+                logger.error(f"Could not send {vendor} health alert email: " + str(e))
+
 async def verify_single_email(email: str) -> dict:
     """Check if an email is real/deliverable. Tries Reoon first (cheaper, high accuracy),
     then Hunter.io if configured, falls back to a free syntax + mail-server (MX) check otherwise."""
@@ -472,7 +527,9 @@ async def verify_single_email(email: str) -> dict:
                     logger.error("Reoon returned an ERROR (not unknown) for " + email + ": " + str(result.get("reason", result)))
                     # this is a real API problem (bad key/no credits/bad request), not a genuine
                     # "we don't know" result - fall through to Hunter/basic instead of lying
+                    await _note_vendor_result("reoon", ok=False)
                 else:
+                    await _note_vendor_result("reoon", ok=True)
                     mapping = {
                         "safe": "valid",
                         "invalid": "invalid",
@@ -487,8 +544,10 @@ async def verify_single_email(email: str) -> dict:
                     return {"status": mapping.get(status, "unknown"), "method": "reoon"}
             else:
                 logger.error("Reoon HTTP " + str(res.status_code) + " for " + email + ": " + res.text[:300])
+                await _note_vendor_result("reoon", ok=False)
         except Exception as e:
             logger.error("Reoon verify error for " + email + ": " + str(e))
+            await _note_vendor_result("reoon", ok=False)
             # fall through to Hunter/basic check below
 
     hunter_key = os.getenv("HUNTER_API_KEY")
@@ -690,9 +749,15 @@ async def scrape_company_websites(niche: str, limit: int) -> list:
                 headers={"Authorization": "Bearer " + tavily_key, "Content-Type": "application/json"},
                 json={"query": niche + " contact", "max_results": min(limit, 10), "search_depth": "basic"}
             )
+            if search_res.status_code != 200:
+                logger.error("Tavily HTTP " + str(search_res.status_code) + ": " + search_res.text[:300])
+                await _note_vendor_result("tavily", ok=False)
+                return []
             items = search_res.json().get("results", [])
+            await _note_vendor_result("tavily", ok=True)
         except Exception as e:
             logger.error("Tavily search failed: " + str(e))
+            await _note_vendor_result("tavily", ok=False)
             return []
 
         for item in items:
@@ -1693,6 +1758,23 @@ async def initiate_payment(data: InitiatePaymentModel, user=Depends(get_current_
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+def _record_payment_once(user_id: str, plan_label: str, amount: int, currency: str, reference: str) -> bool:
+    """Inserts a payments row for this reference. Returns True if this is the
+    FIRST time we've recorded this reference (safe to grant credits/plan now),
+    False if it was already recorded (already granted - do not grant again).
+    Relies on payments.reference having a UNIQUE constraint in Supabase."""
+    try:
+        supabase_admin.table("payments").insert({
+            "user_id": user_id, "plan": plan_label, "amount": amount,
+            "currency": currency, "reference": reference, "status": "success"
+        }).execute()
+        return True
+    except Exception as e:
+        if "duplicate" in str(e).lower() or "unique" in str(e).lower():
+            return False
+        logger.error(f"_record_payment_once failed for reference {reference}: " + str(e))
+        raise
+
 @app.get("/payments/verify/{reference}")
 async def verify_payment(reference: str, user=Depends(get_current_user)):
     secret_key = os.getenv("PAYSTACK_SECRET_KEY")
@@ -1705,25 +1787,18 @@ async def verify_payment(reference: str, user=Depends(get_current_user)):
         result = res.json()
         if result.get("status") and result["data"]["status"] == "success":
             metadata = result["data"].get("metadata", {})
+            amount = result["data"]["amount"]
+            currency = result["data"]["currency"]
 
             if metadata.get("type") == "indepth_search_topup":
                 credits = metadata.get("credits", 0)
+                if not _record_payment_once(user.id, "indepth_search_topup", amount, currency, reference):
+                    return {"message": "This payment was already processed - no changes made.", "already_processed": True}
                 profile = supabase_admin.table("users").select("findymail_credits").eq("id", user.id).single().execute()
                 current_credits = (profile.data or {}).get("findymail_credits") or 0
                 supabase_admin.table("users").update({
                     "findymail_credits": current_credits + credits
                 }).eq("id", user.id).execute()
-                try:
-                    supabase_admin.table("payments").insert({
-                        "user_id": user.id,
-                        "plan": "indepth_search_topup",
-                        "amount": result["data"]["amount"],
-                        "currency": result["data"]["currency"],
-                        "reference": reference,
-                        "status": "success"
-                    }).execute()
-                except Exception:
-                    pass
                 return {
                     "message": f"✅ {credits} in-depth search credits added!",
                     "credits_added": credits,
@@ -1732,22 +1807,13 @@ async def verify_payment(reference: str, user=Depends(get_current_user)):
 
             if metadata.get("type") == "credit_topup":
                 credits = metadata.get("credits", 0)
+                if not _record_payment_once(user.id, "credit_topup_" + metadata.get("pack", ""), amount, currency, reference):
+                    return {"message": "This payment was already processed - no changes made.", "already_processed": True}
                 profile = supabase_admin.table("users").select("scraper_bonus_credits").eq("id", user.id).single().execute()
                 current_bonus = (profile.data or {}).get("scraper_bonus_credits") or 0
                 supabase_admin.table("users").update({
                     "scraper_bonus_credits": current_bonus + credits
                 }).eq("id", user.id).execute()
-                try:
-                    supabase_admin.table("payments").insert({
-                        "user_id": user.id,
-                        "plan": "credit_topup_" + metadata.get("pack", ""),
-                        "amount": result["data"]["amount"],
-                        "currency": result["data"]["currency"],
-                        "reference": reference,
-                        "status": "success"
-                    }).execute()
-                except Exception:
-                    pass
                 return {
                     "message": f"✅ {credits} scraper credits added to your account!",
                     "credits_added": credits,
@@ -1756,6 +1822,8 @@ async def verify_payment(reference: str, user=Depends(get_current_user)):
 
             plan = metadata.get("plan")
             if plan in PLANS:
+                if not _record_payment_once(user.id, plan, amount, currency, reference):
+                    return {"message": "This payment was already processed - no changes made.", "already_processed": True}
                 plan_data = PLANS[plan]
                 supabase_admin.table("users").update({
                     "plan": plan,
@@ -1766,17 +1834,6 @@ async def verify_payment(reference: str, user=Depends(get_current_user)):
                     "campaigns_limit": plan_data["campaigns_limit"],
                     "plan_expires_at": (datetime.utcnow() + timedelta(days=30)).isoformat()
                 }).eq("id", user.id).execute()
-                try:
-                    supabase_admin.table("payments").insert({
-                        "user_id": user.id,
-                        "plan": plan,
-                        "amount": result["data"]["amount"],
-                        "currency": result["data"]["currency"],
-                        "reference": reference,
-                        "status": "success"
-                    }).execute()
-                except Exception:
-                    pass
                 return {
                     "message": "Payment successful! " + plan_data["name"] + " plan activated.",
                     "plan": plan,
@@ -1806,40 +1863,109 @@ async def paystack_webhook(request: Request):
             data = event["data"]
             metadata = data.get("metadata", {})
             user_id = metadata.get("user_id")
+            reference = data.get("reference")
+            amount = data.get("amount")
+            currency = data.get("currency")
 
-            if metadata.get("type") == "indepth_search_topup" and user_id:
+            if metadata.get("type") == "indepth_search_topup" and user_id and reference:
                 credits = metadata.get("credits", 0)
-                profile = supabase_admin.table("users").select("findymail_credits").eq("id", user_id).single().execute()
-                current_credits = (profile.data or {}).get("findymail_credits") or 0
-                supabase_admin.table("users").update({
-                    "findymail_credits": current_credits + credits
-                }).eq("id", user_id).execute()
+                if _record_payment_once(user_id, "indepth_search_topup", amount, currency, reference):
+                    profile = supabase_admin.table("users").select("findymail_credits").eq("id", user_id).single().execute()
+                    current_credits = (profile.data or {}).get("findymail_credits") or 0
+                    supabase_admin.table("users").update({
+                        "findymail_credits": current_credits + credits
+                    }).eq("id", user_id).execute()
                 return {"status": "ok"}
 
-            if metadata.get("type") == "credit_topup" and user_id:
+            if metadata.get("type") == "credit_topup" and user_id and reference:
                 credits = metadata.get("credits", 0)
-                profile = supabase_admin.table("users").select("scraper_bonus_credits").eq("id", user_id).single().execute()
-                current_bonus = (profile.data or {}).get("scraper_bonus_credits") or 0
-                supabase_admin.table("users").update({
-                    "scraper_bonus_credits": current_bonus + credits
-                }).eq("id", user_id).execute()
+                if _record_payment_once(user_id, "credit_topup_" + metadata.get("pack", ""), amount, currency, reference):
+                    profile = supabase_admin.table("users").select("scraper_bonus_credits").eq("id", user_id).single().execute()
+                    current_bonus = (profile.data or {}).get("scraper_bonus_credits") or 0
+                    supabase_admin.table("users").update({
+                        "scraper_bonus_credits": current_bonus + credits
+                    }).eq("id", user_id).execute()
                 return {"status": "ok"}
 
             plan = metadata.get("plan")
-            if user_id and plan and plan in PLANS:
-                plan_data = PLANS[plan]
-                supabase_admin.table("users").update({
-                    "plan": plan,
-                    "daily_limit": plan_data["daily_limit"],
-                    "contacts_limit": plan_data["contacts_limit"],
-                    "smtp_limit": plan_data["smtp_limit"],
-                    "scraper_limit": plan_data["scraper_limit"],
-                    "campaigns_limit": plan_data["campaigns_limit"],
-                    "plan_expires_at": (datetime.utcnow() + timedelta(days=30)).isoformat()
-                }).eq("id", user_id).execute()
+            if user_id and plan and plan in PLANS and reference:
+                if _record_payment_once(user_id, plan, amount, currency, reference):
+                    plan_data = PLANS[plan]
+                    supabase_admin.table("users").update({
+                        "plan": plan,
+                        "daily_limit": plan_data["daily_limit"],
+                        "contacts_limit": plan_data["contacts_limit"],
+                        "smtp_limit": plan_data["smtp_limit"],
+                        "scraper_limit": plan_data["scraper_limit"],
+                        "campaigns_limit": plan_data["campaigns_limit"],
+                        "plan_expires_at": (datetime.utcnow() + timedelta(days=30)).isoformat()
+                    }).eq("id", user_id).execute()
     except Exception as e:
         logger.error("Webhook error: " + str(e))
     return {"status": "ok"}
+
+class ReconcilePaymentModel(BaseModel):
+    reference: str
+    user_email: str
+
+@app.post("/admin/payments/reconcile")
+async def admin_reconcile_payment(data: ReconcilePaymentModel, admin_user=Depends(require_admin)):
+    """For 'I paid but got nothing' reports. Look the reference up in your Paystack
+    dashboard first to confirm it's a genuine successful charge, then call this with
+    the reference and the user's account email. Safe to call more than once - if
+    it was already granted (by the webhook, the user's own verify call, or a
+    previous run of this), it reports that and changes nothing."""
+    secret_key = os.getenv("PAYSTACK_SECRET_KEY")
+    user_row = supabase_admin.table("users").select("id").eq("email", data.user_email.strip().lower()).single().execute()
+    if not user_row.data:
+        raise HTTPException(status_code=404, detail="No user found with that email")
+    user_id = user_row.data["id"]
+
+    async with httpx.AsyncClient() as client:
+        res = await client.get(
+            "https://api.paystack.co/transaction/verify/" + data.reference,
+            headers={"Authorization": "Bearer " + secret_key}
+        )
+    result = res.json()
+    if not (result.get("status") and result["data"]["status"] == "success"):
+        raise HTTPException(status_code=400, detail="Paystack does not show this as a successful payment")
+
+    metadata = result["data"].get("metadata", {})
+    amount = result["data"]["amount"]
+    currency = result["data"]["currency"]
+
+    if metadata.get("type") == "indepth_search_topup":
+        credits = metadata.get("credits", 0)
+        if not _record_payment_once(user_id, "indepth_search_topup", amount, currency, data.reference):
+            return {"message": "Already processed - nothing to do.", "already_processed": True}
+        profile = supabase_admin.table("users").select("findymail_credits").eq("id", user_id).single().execute()
+        current = (profile.data or {}).get("findymail_credits") or 0
+        supabase_admin.table("users").update({"findymail_credits": current + credits}).eq("id", user_id).execute()
+        return {"message": f"Granted {credits} in-depth search credits."}
+
+    if metadata.get("type") == "credit_topup":
+        credits = metadata.get("credits", 0)
+        if not _record_payment_once(user_id, "credit_topup_" + metadata.get("pack", ""), amount, currency, data.reference):
+            return {"message": "Already processed - nothing to do.", "already_processed": True}
+        profile = supabase_admin.table("users").select("scraper_bonus_credits").eq("id", user_id).single().execute()
+        current = (profile.data or {}).get("scraper_bonus_credits") or 0
+        supabase_admin.table("users").update({"scraper_bonus_credits": current + credits}).eq("id", user_id).execute()
+        return {"message": f"Granted {credits} scraper credits."}
+
+    plan = metadata.get("plan")
+    if plan in PLANS:
+        if not _record_payment_once(user_id, plan, amount, currency, data.reference):
+            return {"message": "Already processed - nothing to do.", "already_processed": True}
+        plan_data = PLANS[plan]
+        supabase_admin.table("users").update({
+            "plan": plan, "daily_limit": plan_data["daily_limit"], "contacts_limit": plan_data["contacts_limit"],
+            "smtp_limit": plan_data["smtp_limit"], "scraper_limit": plan_data["scraper_limit"],
+            "campaigns_limit": plan_data["campaigns_limit"],
+            "plan_expires_at": (datetime.utcnow() + timedelta(days=30)).isoformat()
+        }).eq("id", user_id).execute()
+        return {"message": f"Activated {plan_data['name']} plan."}
+
+    raise HTTPException(status_code=400, detail="Could not determine what this payment was for from its metadata")
 
 # ══════════════════════════════════════════════════════════════
 # GOOGLE OAUTH ROUTES — Add to bottom of main.py
