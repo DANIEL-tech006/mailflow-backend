@@ -96,6 +96,100 @@ async def require_admin(user=Depends(get_current_user)):
         raise HTTPException(status_code=403, detail="Admin access only")
     return user
 
+# ── Admin PIN lock (second factor on top of the email check above) ──
+# Every /admin/* route below depends on require_admin_locked, which layers a PIN-gated,
+# time-limited session token on top of the existing admin-email check. Knowing/guessing
+# the admin email (or having a leaked Supabase session) is no longer enough on its own.
+ADMIN_SESSION_TTL_SECONDS = 2 * 60 * 60  # 2 hours
+_admin_pin_attempts: dict = {}  # in-memory, per-process: {user_id: [failed_count, locked_until_ts]}
+ADMIN_PIN_MAX_ATTEMPTS = 5
+ADMIN_PIN_LOCKOUT_MINUTES = 15
+
+def _admin_session_secret() -> str:
+    # Falls back to the webhook secret if a dedicated one isn't set, so this works
+    # without needing a brand-new env var right away - but setting ADMIN_SESSION_SECRET
+    # separately in Railway is recommended.
+    return os.getenv("ADMIN_SESSION_SECRET") or os.getenv("INBOUND_WEBHOOK_SECRET", "mailflows-admin-fallback")
+
+def _make_admin_session_token(user_id: str) -> str:
+    expires_at = int((datetime.utcnow() + timedelta(seconds=ADMIN_SESSION_TTL_SECONDS)).timestamp())
+    payload = f"{user_id}:{expires_at}"
+    sig = hmac.new(_admin_session_secret().encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{payload}:{sig}".encode()).decode()
+
+def _verify_admin_session_token(token: str, user_id: str) -> bool:
+    try:
+        decoded = base64.urlsafe_b64decode(token.encode()).decode()
+        parts = decoded.split(":")
+        if len(parts) != 3:
+            return False
+        token_user_id, expires_at, sig = parts
+        if token_user_id != user_id:
+            return False
+        payload = f"{token_user_id}:{expires_at}"
+        expected_sig = hmac.new(_admin_session_secret().encode(), payload.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected_sig):
+            return False
+        if int(expires_at) < int(datetime.utcnow().timestamp()):
+            return False
+        return True
+    except Exception:
+        return False
+
+async def require_admin_locked(request: Request, user=Depends(require_admin)):
+    token = request.headers.get("X-Admin-Session", "")
+    if not token or not _verify_admin_session_token(token, user.id):
+        raise HTTPException(status_code=401, detail="Admin dashboard is locked - enter the admin PIN")
+    return user
+
+class AdminPinModel(BaseModel):
+    pin: str
+
+@app.get("/admin/check")
+async def admin_check(user=Depends(require_admin)):
+    # Email-only check, no PIN required - just for the frontend to decide whether to
+    # show the Admin nav item at all. Does NOT grant access to any real admin data.
+    return {"is_admin": True}
+
+@app.post("/admin/verify-pin")
+async def verify_admin_pin(data: AdminPinModel, user=Depends(require_admin)):
+    admin_pin = os.getenv("ADMIN_PIN", "")
+    admin_email = os.getenv("ADMIN_EMAIL", "")
+    attempts = _admin_pin_attempts.get(user.id, [0, 0])
+    now_ts = datetime.utcnow().timestamp()
+
+    if attempts[1] and now_ts < attempts[1]:
+        wait_min = round((attempts[1] - now_ts) / 60, 1)
+        raise HTTPException(status_code=429, detail=f"Too many wrong PIN attempts. Try again in {wait_min} minute(s).")
+
+    if not admin_pin:
+        logger.error("ADMIN_PIN not set - admin dashboard lock cannot be enforced!")
+        raise HTTPException(status_code=500, detail="Admin PIN not configured on the server")
+
+    if not hmac.compare_digest(data.pin, admin_pin):
+        attempts[0] += 1
+        if attempts[0] >= ADMIN_PIN_MAX_ATTEMPTS:
+            attempts[1] = now_ts + (ADMIN_PIN_LOCKOUT_MINUTES * 60)
+            attempts[0] = 0
+        _admin_pin_attempts[user.id] = attempts
+        if admin_email:
+            await send_resend_email(
+                admin_email,
+                "⚠️ MailFlows admin PIN entered incorrectly",
+                f"<p>A wrong admin PIN was entered for the MailFlows admin dashboard.</p><p>Attempt {attempts[0]} of {ADMIN_PIN_MAX_ATTEMPTS} before a {ADMIN_PIN_LOCKOUT_MINUTES}-minute lockout.</p><p>Time (UTC): {datetime.utcnow().isoformat()}</p>"
+            )
+        raise HTTPException(status_code=403, detail="Incorrect PIN")
+
+    _admin_pin_attempts.pop(user.id, None)
+    token = _make_admin_session_token(user.id)
+    if admin_email:
+        await send_resend_email(
+            admin_email,
+            "🔓 MailFlows admin dashboard unlocked",
+            f"<p>The MailFlows admin dashboard was just unlocked.</p><p>Time (UTC): {datetime.utcnow().isoformat()}</p><p>If this wasn't you, rotate ADMIN_PIN in Railway immediately.</p>"
+        )
+    return {"admin_session_token": token, "expires_in": ADMIN_SESSION_TTL_SECONDS}
+
 class RegisterModel(BaseModel):
     email: EmailStr
     password: str
@@ -1125,6 +1219,16 @@ async def inbound_reply_webhook(data: InboundReplyModel, request: Request):
 
 @app.post("/gmail/check-replies")
 async def check_replies(user=Depends(get_current_user)):
+    # RETIRED as of the gmail.metadata scope removal above. This endpoint used to poll
+    # Gmail directly (one API round-trip per open thread, sequentially - the real cause
+    # of "refresh takes minutes"), and only ever stored msg.get("snippet","") as the
+    # reply body - the real cause of replies showing only a heading/first line instead
+    # of the full message. The Cloudflare Email Routing + Worker webhook now delivers
+    # full-body replies in real time with no polling needed, so this is now a no-op that
+    # returns immediately rather than making live Gmail calls that will fail anyway for
+    # any account connected after the scope change (no more metadata grant to use).
+    return {"new_replies": 0, "note": "Legacy polling retired - replies now arrive automatically via webhook."}
+    # --- everything below is dead code, kept only for reference / rollback ---
     sent_rows = supabase_admin.table("emails_sent").select("*").eq(
         "user_id", user.id
     ).order("sent_at", desc=True).limit(200).execute()
@@ -1310,7 +1414,7 @@ async def get_announcements(user=Depends(get_current_user)):
     return result.data or []
 
 @app.post("/admin/announcements/upload")
-async def upload_announcement_media(file: UploadFile = File(...), user=Depends(require_admin)):
+async def upload_announcement_media(file: UploadFile = File(...), user=Depends(require_admin_locked)):
     try:
         contents = await file.read()
         max_size = 20 * 1024 * 1024  # 20MB cap
@@ -1332,7 +1436,7 @@ async def upload_announcement_media(file: UploadFile = File(...), user=Depends(r
         raise HTTPException(status_code=400, detail="Upload failed: " + str(e))
 
 @app.post("/admin/announcements")
-async def create_announcement(data: AnnouncementModel, user=Depends(require_admin)):
+async def create_announcement(data: AnnouncementModel, user=Depends(require_admin_locked)):
     result = supabase_admin.table("announcements").insert({
         "title": data.title,
         "body": data.body,
@@ -1343,12 +1447,12 @@ async def create_announcement(data: AnnouncementModel, user=Depends(require_admi
     return result.data[0]
 
 @app.delete("/admin/announcements/{announcement_id}")
-async def delete_announcement(announcement_id: str, user=Depends(require_admin)):
+async def delete_announcement(announcement_id: str, user=Depends(require_admin_locked)):
     supabase_admin.table("announcements").delete().eq("id", announcement_id).execute()
     return {"message": "Announcement deleted"}
 
 @app.get("/admin/stats")
-async def admin_stats(user=Depends(require_admin)):
+async def admin_stats(user=Depends(require_admin_locked)):
     try:
         all_users = supabase_admin.table("users").select(
             "id, plan, scraper_used_this_month, scraper_limit, scraper_reset_month, created_at"
@@ -1429,14 +1533,14 @@ async def admin_stats(user=Depends(require_admin)):
     }
 
 @app.get("/admin/users")
-async def admin_list_users(user=Depends(require_admin)):
+async def admin_list_users(user=Depends(require_admin_locked)):
     result = supabase_admin.table("users").select(
         "id, email, full_name, plan, scraper_used_this_month, scraper_limit, created_at"
     ).order("created_at", desc=True).execute()
     return result.data
 
 @app.delete("/admin/users/{user_id}")
-async def delete_user(user_id: str, user=Depends(require_admin)):
+async def delete_user(user_id: str, user=Depends(require_admin_locked)):
     try:
         for table in ["replies", "emails_sent", "campaigns", "scraped_contacts", "smtp_accounts", "payments"]:
             try:
@@ -1550,12 +1654,12 @@ async def reply_to_support_ticket(ticket_id: str, data: SupportMessageCreate, us
     return {"message": "Reply added"}
 
 @app.get("/admin/support-tickets")
-async def admin_list_support_tickets(user=Depends(require_admin)):
+async def admin_list_support_tickets(user=Depends(require_admin_locked)):
     result = supabase_admin.table("support_tickets").select("*").order("updated_at", desc=True).execute()
     return result.data or []
 
 @app.get("/admin/support-tickets/{ticket_id}")
-async def admin_get_support_ticket(ticket_id: str, user=Depends(require_admin)):
+async def admin_get_support_ticket(ticket_id: str, user=Depends(require_admin_locked)):
     ticket = supabase_admin.table("support_tickets").select("*").eq("id", ticket_id).single().execute()
     if not ticket.data:
         raise HTTPException(status_code=404, detail="Ticket not found")
@@ -1565,7 +1669,7 @@ async def admin_get_support_ticket(ticket_id: str, user=Depends(require_admin)):
     return {"ticket": ticket.data, "messages": messages.data or []}
 
 @app.post("/admin/support-tickets/{ticket_id}/reply")
-async def admin_reply_support_ticket(ticket_id: str, data: SupportMessageCreate, user=Depends(require_admin)):
+async def admin_reply_support_ticket(ticket_id: str, data: SupportMessageCreate, user=Depends(require_admin_locked)):
     ticket = supabase_admin.table("support_tickets").select("*").eq("id", ticket_id).single().execute()
     if not ticket.data:
         raise HTTPException(status_code=404, detail="Ticket not found")
@@ -1589,7 +1693,7 @@ async def admin_reply_support_ticket(ticket_id: str, data: SupportMessageCreate,
     return {"message": "Reply sent"}
 
 @app.patch("/admin/support-tickets/{ticket_id}/status")
-async def admin_update_support_status(ticket_id: str, data: SupportStatusUpdate, user=Depends(require_admin)):
+async def admin_update_support_status(ticket_id: str, data: SupportStatusUpdate, user=Depends(require_admin_locked)):
     if data.status not in ("open", "answered", "closed"):
         raise HTTPException(status_code=400, detail="Invalid status")
     supabase_admin.table("support_tickets").update({
@@ -2015,7 +2119,7 @@ class ReconcilePaymentModel(BaseModel):
     user_email: str
 
 @app.post("/admin/payments/reconcile")
-async def admin_reconcile_payment(data: ReconcilePaymentModel, admin_user=Depends(require_admin)):
+async def admin_reconcile_payment(data: ReconcilePaymentModel, admin_user=Depends(require_admin_locked)):
     """For 'I paid but got nothing' reports. Look the reference up in your Paystack
     dashboard first to confirm it's a genuine successful charge, then call this with
     the reference and the user's account email. Safe to call more than once - if
@@ -2105,18 +2209,24 @@ FRONTEND_URL = os.getenv("FRONTEND_URL", "https://effervescent-nasturtium-6a71c2
 
 GMAIL_SCOPES = [
     "https://www.googleapis.com/auth/gmail.send",
-    "https://www.googleapis.com/auth/gmail.metadata",
     "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/userinfo.profile",
 ]
-# NOTE: gmail.metadata is a "Sensitive" scope (free, self-declared verification).
-# gmail.readonly is "Restricted" and requires a paid CASA security assessment.
-# gmail.metadata only allows Gmail API calls with format=metadata (headers + snippet,
-# no full body, no raw MIME). check_replies() below already only ever requested
-# format=metadata, so this scope change requires no change to that function.
-# It DOES mean MailFlow can never fetch a reply's full body via the API - see the
-# reply UI, which is built around that limitation (redirect-to-Gmail as the primary
-# action, since Gmail itself always has full body access).
+# gmail.metadata REMOVED. This was a leftover from an earlier attempt to dodge Google's
+# CASA security review by requesting a lighter read-scope instead of gmail.readonly.
+# It's no longer needed: the Cloudflare Email Routing + Worker pipeline (see
+# /webhooks/inbound-reply below) captures full reply bodies without any Gmail read
+# scope at all. Leaving gmail.metadata in here was actively harmful - it kept the old
+# check_replies() snippet-only path alive and wired to the frontend's Refresh button,
+# which is why replies sometimes showed only a short snippet/heading instead of the
+# real body even though the webhook pipeline had the full text the whole time.
+# gmail.send is a Sensitive scope (self-declared, no CASA). That's now the only Gmail
+# scope MailFlows requests.
+#
+# IMPORTANT: users who connected Gmail before this change granted gmail.metadata too.
+# That old grant doesn't get revoked automatically - it just stops being requested for
+# new/re connections. If you want it fully gone for existing users, they'd need to
+# disconnect and reconnect Gmail (or revoke access at myaccount.google.com/permissions).
 
 class GmailAccountLabel(BaseModel):
     label: str = "Gmail"
@@ -2194,9 +2304,23 @@ async def google_callback(code: str, state: str):
 
         try:
             # Check if already exists
-            existing = supabase_admin.table("gmail_accounts").select("id").eq(
+            existing = supabase_admin.table("gmail_accounts").select("id, is_active").eq(
                 "user_id", user_id
             ).eq("gmail_address", gmail_address).execute()
+
+            was_inactive = bool(existing.data) and not existing.data[0].get("is_active", True)
+            is_brand_new = not existing.data
+
+            # 10-hour cooldown: only applies when (re)activating an account that was
+            # disconnected, or adding a genuinely new account. Refreshing tokens on an
+            # already-active account is unaffected.
+            if was_inactive or is_brand_new:
+                cooldown_msg = await check_gmail_reconnect_cooldown(user_id)
+                if cooldown_msg:
+                    from urllib.parse import quote
+                    return RedirectResponse(
+                        url=FRONTEND_URL + "?gmail_error=cooldown&gmail_error_detail=" + quote(cooldown_msg)
+                    )
 
             if existing.data:
                 # Update existing
@@ -2247,15 +2371,44 @@ async def list_gmail_accounts(user=Depends(get_current_user)):
     return accounts
 
 # ── Step 4: Delete Gmail account ──
+GMAIL_RECONNECT_COOLDOWN_HOURS = 10
+
 @app.delete("/gmail/accounts/{account_id}")
 async def delete_gmail_account(account_id: str, user=Depends(get_current_user)):
     # Soft-delete only - deactivate but keep sent_today history intact.
     # A hard delete would let someone disconnect+reconnect to reset their daily
     # counter, silently letting real usage exceed the safe limit without us knowing.
     supabase_admin.table("gmail_accounts").update({
-        "is_active": False
+        "is_active": False,
+        "disconnected_at": datetime.utcnow().isoformat(),
     }).eq("id", account_id).eq("user_id", user.id).execute()
     return {"message": "Gmail account disconnected"}
+
+
+async def check_gmail_reconnect_cooldown(user_id: str) -> Optional[str]:
+    """Returns an error message if this user disconnected ANY Gmail account within the
+    last GMAIL_RECONNECT_COOLDOWN_HOURS, else None. Blocks both reactivating the same
+    account and connecting a brand-new one during the cooldown, so someone can't
+    disconnect+reconnect (same or different address) to reset daily counters or dodge
+    per-account limits."""
+    recent = supabase_admin.table("gmail_accounts").select("disconnected_at").eq(
+        "user_id", user_id
+    ).eq("is_active", False).not_.is_("disconnected_at", "null").order(
+        "disconnected_at", desc=True
+    ).limit(1).execute()
+    if not recent.data:
+        return None
+    last = recent.data[0].get("disconnected_at")
+    if not last:
+        return None
+    disconnected_at = datetime.fromisoformat(last.replace("Z", "+00:00")) if "Z" in last else datetime.fromisoformat(last)
+    if disconnected_at.tzinfo is not None:
+        disconnected_at = disconnected_at.replace(tzinfo=None)
+    elapsed_hours = (datetime.utcnow() - disconnected_at).total_seconds() / 3600
+    if elapsed_hours < GMAIL_RECONNECT_COOLDOWN_HOURS:
+        remaining = round(GMAIL_RECONNECT_COOLDOWN_HOURS - elapsed_hours, 1)
+        return f"You disconnected a Gmail account recently. For accurate sending counts, you can't connect or reconnect a Gmail account for {remaining} more hour(s)."
+    return None
 
 # ── Helper: Get fresh access token ──
 async def get_fresh_access_token(account: dict) -> str:
