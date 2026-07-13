@@ -142,6 +142,15 @@ CREDIT_PACKS = {
     "large": {"credits": 150, "amount_ngn": 320000, "amount_usd": 200}   # ₦3,200 / $2.00 - 150 email credits
 }
 
+# Verification credit top-ups - separate pool from scraper credits. Priced the same
+# as scraper packs for now as a placeholder; adjust independently once real Reoon
+# per-verification cost is known.
+VERIFICATION_CREDIT_PACKS = {
+    "small": {"credits": 10, "amount_ngn": 17600, "amount_usd": 11},
+    "medium": {"credits": 50, "amount_ngn": 96000, "amount_usd": 60},
+    "large": {"credits": 150, "amount_ngn": 320000, "amount_usd": 200}
+}
+
 PLANS = {
     "personal": {
         "name": "Personal",
@@ -591,8 +600,8 @@ async def verify_contacts(data: VerifyContactsModel, user=Depends(get_current_us
     if quota["remaining"] <= 0:
         raise HTTPException(
             status_code=403,
-            detail=f"Verification limit reached ({quota['used']}/{quota['limit']} this month). "
-                   f"This resets monthly and can't be extended with scraper credits - upgrade your plan for more."
+            detail=f"Verification limit reached ({quota['used']}/{quota['limit']} this month, "
+                   f"+{quota['bonus_credits']} bonus). Buy more verification credits or upgrade your plan."
         )
 
     query = supabase_admin.table("scraped_contacts").select("id,email").eq("user_id", user.id)
@@ -619,11 +628,24 @@ async def verify_contacts(data: VerifyContactsModel, user=Depends(get_current_us
         verified_count += 1
         await asyncio.sleep(0.3)  # gentle pacing to avoid rate limits
 
+    # Charge monthly allowance first, then bonus (purchased) verification credits
+    monthly_remaining = max(quota["limit"] - quota["used"], 0)
+    from_monthly = min(verified_count, monthly_remaining)
+    from_bonus = verified_count - from_monthly
+    new_used = quota["used"] + from_monthly
+    new_bonus = max(quota["bonus_credits"] - from_bonus, 0)
     supabase_admin.table("users").update({
-        "verification_used_this_month": quota["used"] + verified_count
+        "verification_used_this_month": new_used,
+        "verification_bonus_credits": new_bonus
     }).eq("id", user.id).execute()
 
-    return {"verified": verified_count, "results": results, "verification_remaining": quota["remaining"] - verified_count}
+    return {
+        "verified": verified_count,
+        "results": results,
+        "verification_used": new_used,
+        "verification_limit": quota["limit"],
+        "bonus_credits_remaining": new_bonus
+    }
 
 async def get_scraper_quota(user_id: str) -> dict:
     """Returns current scraper usage/limit, resetting the monthly counter if a new month started.
@@ -668,11 +690,11 @@ async def get_scraper_quota(user_id: str) -> dict:
 
 async def get_verification_quota(user_id: str) -> dict:
     """Email verification has its own monthly allowance, sized to match the plan's
-    scraper credit number - but unlike scraping, it can NOT be extended by buying
-    bonus scraper credits. It resets monthly on its own counter."""
+    scraper credit number. It can also now be extended with purchased verification
+    bonus credits (separate pool from scraper bonus credits)."""
     try:
         profile = supabase_admin.table("users").select(
-            "plan, scraper_limit, verification_used_this_month, verification_reset_month"
+            "plan, scraper_limit, verification_used_this_month, verification_reset_month, verification_bonus_credits"
         ).eq("id", user_id).single().execute()
         profile_data = profile.data
     except Exception as e:
@@ -682,10 +704,12 @@ async def get_verification_quota(user_id: str) -> dict:
     plan_fallback_limits = {"free": 4, "personal": 100, "corporate": 500}
     limit = 4
     used = 0
+    bonus = 0
     if profile_data:
         plan = (profile_data.get("plan") or "free").lower()
         limit = profile_data.get("scraper_limit") or plan_fallback_limits.get(plan, 4)
         used = profile_data.get("verification_used_this_month") or 0
+        bonus = profile_data.get("verification_bonus_credits") or 0
         current_month = datetime.utcnow().strftime("%Y-%m")
         if profile_data.get("verification_reset_month") != current_month:
             used = 0
@@ -697,7 +721,13 @@ async def get_verification_quota(user_id: str) -> dict:
             except Exception as e:
                 logger.error("get_verification_quota reset update failed: " + str(e))
 
-    return {"limit": limit, "used": used, "remaining": max(limit - used, 0)}
+    monthly_remaining = max(limit - used, 0)
+    return {
+        "limit": limit,
+        "used": used,
+        "bonus_credits": bonus,
+        "remaining": monthly_remaining + bonus
+    }
 
 # ── Company website scraper: finds emails businesses have published on their own site ──
 from urllib.parse import urlparse
@@ -1354,7 +1384,7 @@ async def admin_stats(user=Depends(require_admin)):
         ).eq("status", "success").gte("created_at", current_month_start).execute()
         for p in (topup_payments.data or []):
             ptype = (p.get("plan") or "")
-            if ptype.startswith("credit_topup") or ptype.startswith("indepth_search"):
+            if ptype.startswith("credit_topup") or ptype.startswith("indepth_search") or ptype.startswith("verification_credit_topup"):
                 amt = (p.get("amount") or 0) / 100
                 if (p.get("currency") or "NGN").upper() == "NGN":
                     topup_ngn += amt
@@ -1600,7 +1630,8 @@ async def get_credit_summary(user=Depends(get_current_user)):
         "verification": {
             "monthly_limit": verify_quota["limit"],
             "monthly_used": verify_quota["used"],
-            "monthly_remaining": verify_quota["remaining"]
+            "monthly_remaining": max(verify_quota["limit"] - verify_quota["used"], 0),
+            "bonus_credits": verify_quota["bonus_credits"]
         },
         "purchase_history": purchases
     }
@@ -1612,6 +1643,56 @@ class BuyCreditsModel(BaseModel):
 @app.get("/payments/credit-packs")
 async def get_credit_packs():
     return CREDIT_PACKS
+
+@app.get("/payments/verification-credit-packs")
+async def get_verification_credit_packs():
+    return VERIFICATION_CREDIT_PACKS
+
+class BuyVerificationCreditsModel(BaseModel):
+    pack: str
+    currency: str
+
+@app.post("/payments/buy-verification-credits")
+async def buy_verification_credits(data: BuyVerificationCreditsModel, user=Depends(get_current_user)):
+    if data.pack not in VERIFICATION_CREDIT_PACKS:
+        raise HTTPException(status_code=400, detail="Invalid credit pack")
+    if data.currency not in ["NGN", "USD"]:
+        raise HTTPException(status_code=400, detail="Invalid currency")
+    pack = VERIFICATION_CREDIT_PACKS[data.pack]
+    amount = pack["amount_ngn"] if data.currency == "NGN" else pack["amount_usd"]
+    secret_key = os.getenv("PAYSTACK_SECRET_KEY")
+    frontend_url = os.getenv("FRONTEND_URL", "https://effervescent-nasturtium-6a71c2.netlify.app")
+    try:
+        async with httpx.AsyncClient() as client:
+            res = await client.post(
+                "https://api.paystack.co/transaction/initialize",
+                headers={"Authorization": "Bearer " + secret_key, "Content-Type": "application/json"},
+                json={
+                    "email": user.email,
+                    "amount": amount,
+                    "currency": data.currency,
+                    "metadata": {
+                        "user_id": user.id,
+                        "type": "verification_credit_topup",
+                        "pack": data.pack,
+                        "credits": pack["credits"],
+                        "currency": data.currency
+                    },
+                    "callback_url": frontend_url
+                }
+            )
+        result = res.json()
+        if result.get("status"):
+            return {
+                "payment_url": result["data"]["authorization_url"],
+                "reference": result["data"]["reference"],
+                "credits": pack["credits"],
+                "amount": amount,
+                "currency": data.currency
+            }
+        raise HTTPException(status_code=400, detail="Payment initiation failed")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 # ── Findymail "In-Depth Search" - pay for exactly the quantity you want, not fixed packs ──
 def get_findymail_price_per_credit(currency: str) -> float:
@@ -1820,6 +1901,21 @@ async def verify_payment(reference: str, user=Depends(get_current_user)):
                     "new_balance": current_bonus + credits
                 }
 
+            if metadata.get("type") == "verification_credit_topup":
+                credits = metadata.get("credits", 0)
+                if not _record_payment_once(user.id, "verification_credit_topup_" + metadata.get("pack", ""), amount, currency, reference):
+                    return {"message": "This payment was already processed - no changes made.", "already_processed": True}
+                profile = supabase_admin.table("users").select("verification_bonus_credits").eq("id", user.id).single().execute()
+                current_bonus = (profile.data or {}).get("verification_bonus_credits") or 0
+                supabase_admin.table("users").update({
+                    "verification_bonus_credits": current_bonus + credits
+                }).eq("id", user.id).execute()
+                return {
+                    "message": f"✅ {credits} verification credits added to your account!",
+                    "credits_added": credits,
+                    "new_balance": current_bonus + credits
+                }
+
             plan = metadata.get("plan")
             if plan in PLANS:
                 if not _record_payment_once(user.id, plan, amount, currency, reference):
@@ -1887,6 +1983,16 @@ async def paystack_webhook(request: Request):
                     }).eq("id", user_id).execute()
                 return {"status": "ok"}
 
+            if metadata.get("type") == "verification_credit_topup" and user_id and reference:
+                credits = metadata.get("credits", 0)
+                if _record_payment_once(user_id, "verification_credit_topup_" + metadata.get("pack", ""), amount, currency, reference):
+                    profile = supabase_admin.table("users").select("verification_bonus_credits").eq("id", user_id).single().execute()
+                    current_bonus = (profile.data or {}).get("verification_bonus_credits") or 0
+                    supabase_admin.table("users").update({
+                        "verification_bonus_credits": current_bonus + credits
+                    }).eq("id", user_id).execute()
+                return {"status": "ok"}
+
             plan = metadata.get("plan")
             if user_id and plan and plan in PLANS and reference:
                 if _record_payment_once(user_id, plan, amount, currency, reference):
@@ -1951,6 +2057,15 @@ async def admin_reconcile_payment(data: ReconcilePaymentModel, admin_user=Depend
         current = (profile.data or {}).get("scraper_bonus_credits") or 0
         supabase_admin.table("users").update({"scraper_bonus_credits": current + credits}).eq("id", user_id).execute()
         return {"message": f"Granted {credits} scraper credits."}
+
+    if metadata.get("type") == "verification_credit_topup":
+        credits = metadata.get("credits", 0)
+        if not _record_payment_once(user_id, "verification_credit_topup_" + metadata.get("pack", ""), amount, currency, data.reference):
+            return {"message": "Already processed - nothing to do.", "already_processed": True}
+        profile = supabase_admin.table("users").select("verification_bonus_credits").eq("id", user_id).single().execute()
+        current = (profile.data or {}).get("verification_bonus_credits") or 0
+        supabase_admin.table("users").update({"verification_bonus_credits": current + credits}).eq("id", user_id).execute()
+        return {"message": f"Granted {credits} verification credits."}
 
     plan = metadata.get("plan")
     if plan in PLANS:
