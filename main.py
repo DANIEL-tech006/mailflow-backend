@@ -854,25 +854,28 @@ async def get_scraper_quota(user_id: str) -> dict:
     }
 
 async def get_verification_quota(user_id: str) -> dict:
-    """Email verification has its own monthly allowance, sized to match the plan's
-    scraper credit number. It can also now be extended with purchased verification
-    bonus credits (separate pool from scraper bonus credits)."""
+    """Email verification has its own monthly USAGE counter and its own bonus-credit
+    pool, but its LIMIT always mirrors the scraper limit exactly - it calls
+    get_scraper_quota() directly for that number instead of re-deriving it, so the two
+    can never drift out of sync (which is what was happening: a corporate-plan user
+    was seeing scraper=500 but verification=4, because this function used to look up
+    "scraper_limit" itself via a second, separate query+fallback that could resolve
+    differently than the scraper endpoint's own resolution)."""
+    scraper = await get_scraper_quota(user_id)
+    limit = scraper["limit"]
+
     try:
         profile = supabase_admin.table("users").select(
-            "plan, scraper_limit, verification_used_this_month, verification_reset_month, verification_bonus_credits"
+            "verification_used_this_month, verification_reset_month, verification_bonus_credits"
         ).eq("id", user_id).single().execute()
         profile_data = profile.data
     except Exception as e:
         logger.error("get_verification_quota query failed for user " + user_id + ": " + str(e))
         profile_data = None
 
-    plan_fallback_limits = {"free": 4, "personal": 100, "corporate": 500}
-    limit = 4
     used = 0
     bonus = 0
     if profile_data:
-        plan = (profile_data.get("plan") or "free").lower()
-        limit = profile_data.get("scraper_limit") or plan_fallback_limits.get(plan, 4)
         used = profile_data.get("verification_used_this_month") or 0
         bonus = profile_data.get("verification_bonus_credits") or 0
         current_month = datetime.utcnow().strftime("%Y-%m")
@@ -2064,11 +2067,15 @@ async def verify_payment(reference: str, user=Depends(get_current_user)):
                 credits = metadata.get("credits", 0)
                 if not _record_payment_once(user.id, "credit_topup_" + metadata.get("pack", ""), amount, currency, reference):
                     return {"message": "This payment was already processed - no changes made.", "already_processed": True}
-                profile = supabase_admin.table("users").select("scraper_bonus_credits").eq("id", user.id).single().execute()
-                current_bonus = (profile.data or {}).get("scraper_bonus_credits") or 0
-                supabase_admin.table("users").update({
-                    "scraper_bonus_credits": current_bonus + credits
-                }).eq("id", user.id).execute()
+                try:
+                    profile = supabase_admin.table("users").select("scraper_bonus_credits").eq("id", user.id).single().execute()
+                    current_bonus = (profile.data or {}).get("scraper_bonus_credits") or 0
+                    supabase_admin.table("users").update({
+                        "scraper_bonus_credits": current_bonus + credits
+                    }).eq("id", user.id).execute()
+                except Exception as e:
+                    logger.error(f"CREDIT GRANT FAILED after payment recorded! reference={reference} user={user.id} credits={credits} type=scraper error=" + str(e))
+                    return {"message": "Payment received, but crediting your account failed - contact support with this reference: " + reference, "credit_grant_failed": True}
                 return {
                     "message": f"✅ {credits} scraper credits added to your account!",
                     "credits_added": credits,
@@ -2079,11 +2086,15 @@ async def verify_payment(reference: str, user=Depends(get_current_user)):
                 credits = metadata.get("credits", 0)
                 if not _record_payment_once(user.id, "verification_credit_topup_" + metadata.get("pack", ""), amount, currency, reference):
                     return {"message": "This payment was already processed - no changes made.", "already_processed": True}
-                profile = supabase_admin.table("users").select("verification_bonus_credits").eq("id", user.id).single().execute()
-                current_bonus = (profile.data or {}).get("verification_bonus_credits") or 0
-                supabase_admin.table("users").update({
-                    "verification_bonus_credits": current_bonus + credits
-                }).eq("id", user.id).execute()
+                try:
+                    profile = supabase_admin.table("users").select("verification_bonus_credits").eq("id", user.id).single().execute()
+                    current_bonus = (profile.data or {}).get("verification_bonus_credits") or 0
+                    supabase_admin.table("users").update({
+                        "verification_bonus_credits": current_bonus + credits
+                    }).eq("id", user.id).execute()
+                except Exception as e:
+                    logger.error(f"CREDIT GRANT FAILED after payment recorded! reference={reference} user={user.id} credits={credits} type=verification error=" + str(e))
+                    return {"message": "Payment received, but crediting your account failed - contact support with this reference: " + reference, "credit_grant_failed": True}
                 return {
                     "message": f"✅ {credits} verification credits added to your account!",
                     "credits_added": credits,
@@ -2183,6 +2194,43 @@ async def paystack_webhook(request: Request):
     except Exception as e:
         logger.error("Webhook error: " + str(e))
     return {"status": "ok"}
+
+class AdjustCreditsModel(BaseModel):
+    user_email: str
+    scraper_bonus_delta: int = 0
+    verification_bonus_delta: int = 0
+    reason: str
+
+@app.post("/admin/users/adjust-credits")
+async def admin_adjust_credits(data: AdjustCreditsModel, admin_user=Depends(require_admin_locked)):
+    """Directly adds (or subtracts, with a negative number) bonus credits for a user.
+    Unlike /admin/payments/reconcile, this does NOT check payment references at all -
+    use it when a payment was already recorded (so reconcile says 'already processed')
+    but the credits never actually landed, which can happen if the bonus-credit UPDATE
+    step threw an exception after the payment row was already inserted."""
+    user_row = supabase_admin.table("users").select(
+        "id, scraper_bonus_credits, verification_bonus_credits"
+    ).eq("email", data.user_email.strip().lower()).single().execute()
+    if not user_row.data:
+        raise HTTPException(status_code=404, detail="No user found with that email")
+
+    user_id = user_row.data["id"]
+    new_scraper_bonus = max((user_row.data.get("scraper_bonus_credits") or 0) + data.scraper_bonus_delta, 0)
+    new_verification_bonus = max((user_row.data.get("verification_bonus_credits") or 0) + data.verification_bonus_delta, 0)
+
+    supabase_admin.table("users").update({
+        "scraper_bonus_credits": new_scraper_bonus,
+        "verification_bonus_credits": new_verification_bonus
+    }).eq("id", user_id).execute()
+
+    logger.info(f"Admin credit adjustment for {data.user_email}: scraper {data.scraper_bonus_delta:+d} -> {new_scraper_bonus}, "
+                f"verification {data.verification_bonus_delta:+d} -> {new_verification_bonus}. Reason: {data.reason}")
+
+    return {
+        "message": "Credits adjusted.",
+        "scraper_bonus_credits": new_scraper_bonus,
+        "verification_bonus_credits": new_verification_bonus
+    }
 
 class ReconcilePaymentModel(BaseModel):
     reference: str
