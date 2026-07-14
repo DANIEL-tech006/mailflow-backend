@@ -152,32 +152,57 @@ async def admin_check(user=Depends(require_admin)):
     return {"is_admin": True}
 
 @app.get("/admin/alerts-summary")
-async def admin_alerts_summary(user=Depends(require_admin)):
+async def admin_alerts_summary(since: Optional[str] = None, user=Depends(require_admin)):
     # Email-only (no PIN) - this is just a glance-able badge count, same sensitivity
-    # level as /admin/check. Real ticket/payment content still requires unlocking.
-    try:
-        open_tickets = supabase_admin.table("support_tickets").select(
-            "id", count="exact"
-        ).eq("status", "open").execute()
-        open_tickets_count = open_tickets.count or 0
-    except Exception as e:
-        logger.error("admin_alerts_summary open_tickets query failed: " + str(e))
-        open_tickets_count = 0
+    # level as /admin/check. Real ticket/payment/user content still requires unlocking.
+    #
+    # `since` is an ISO timestamp the frontend sends (its last-seen time, stored in
+    # localStorage). Only items created AFTER it count - this is what makes the badge
+    # show real NEW activity instead of a permanently-nonzero count of everything open.
+    if not since:
+        since = (datetime.utcnow() - timedelta(days=1)).isoformat()
 
-    try:
-        since = (datetime.utcnow() - timedelta(hours=24)).isoformat()
-        recent_payments = supabase_admin.table("payments").select(
-            "id", count="exact"
-        ).eq("status", "success").gte("created_at", since).execute()
-        recent_payments_count = recent_payments.count or 0
-    except Exception as e:
-        logger.error("admin_alerts_summary payments query failed: " + str(e))
-        recent_payments_count = 0
+    def _safe_count(table: str, filters: list) -> int:
+        try:
+            q = supabase_admin.table(table).select("id", count="exact")
+            for col, op, val in filters:
+                q = getattr(q, op)(col, val)
+            return q.execute().count or 0
+        except Exception as e:
+            logger.error(f"admin_alerts_summary {table} query failed: " + str(e))
+            return 0
 
+    new_users = _safe_count("users", [("created_at", "gte", since)])
+    new_payments = _safe_count("payments", [("status", "eq", "success"), ("created_at", "gte", since)])
+    new_tickets = _safe_count("support_tickets", [("created_at", "gte", since)])
+    # Tickets a user replied to again (status flips back to 'open') also count as "new"
+    # activity needing attention, not just brand-new tickets.
+    reopened_tickets = _safe_count("support_tickets", [("status", "eq", "open"), ("updated_at", "gte", since)])
+
+    # Persistent signal, NOT timestamp-based: is anyone currently close to running out
+    # of scraper or verification credits right now? This should show as long as it's
+    # true, not just once - it's "pay attention to demand," not "something new happened."
+    running_low = 0
+    try:
+        near_limit_users = supabase_admin.table("users").select(
+            "id, plan, scraper_used_this_month, scraper_limit, verification_used_this_month, verification_limit"
+        ).neq("plan", "free").execute()
+        for u in (near_limit_users.data or []):
+            s_used, s_limit = u.get("scraper_used_this_month") or 0, u.get("scraper_limit") or 0
+            v_used, v_limit = u.get("verification_used_this_month") or 0, u.get("verification_limit") or 0
+            if (s_limit and s_used >= s_limit * 0.9) or (v_limit and v_used >= v_limit * 0.9):
+                running_low += 1
+    except Exception as e:
+        logger.error("admin_alerts_summary low-limit query failed: " + str(e))
+
+    total = new_users + new_payments + new_tickets + reopened_tickets + (1 if running_low else 0)
     return {
-        "open_tickets": open_tickets_count,
-        "recent_payments_24h": recent_payments_count,
-        "total": open_tickets_count + recent_payments_count
+        "new_users": new_users,
+        "new_payments": new_payments,
+        "new_tickets": new_tickets,
+        "reopened_tickets": reopened_tickets,
+        "users_running_low": running_low,
+        "total": total
     }
 
 @app.post("/admin/verify-pin")
@@ -260,18 +285,21 @@ class InitiatePaymentModel(BaseModel):
     currency: str = "NGN"
 
 CREDIT_PACKS = {
-    "small": {"credits": 10, "amount_ngn": 25600, "amount_usd": 16},     # ₦256 / $0.16 - 10 email credits (base cost + $0.05 margin)
-    "medium": {"credits": 50, "amount_ngn": 104000, "amount_usd": 65},   # ₦1,040 / $0.65 - 50 email credits (base cost + $0.05 margin)
-    "large": {"credits": 150, "amount_ngn": 328000, "amount_usd": 205}   # ₦3,280 / $2.05 - 150 email credits (base cost + $0.05 margin)
+    # Real cost basis (Tavily, per email found): ~$0.012/credit, confirmed linear
+    # across 10/100/150 volumes. Flat $0.05 margin added per pack (not per credit).
+    "small": {"credits": 10, "amount_ngn": 27200, "amount_usd": 17},     # ₦272 / $0.17 - 10 email credits
+    "medium": {"credits": 50, "amount_ngn": 104000, "amount_usd": 65},  # ₦1,040 / $0.65 - 50 email credits
+    "large": {"credits": 150, "amount_ngn": 296000, "amount_usd": 185}  # ₦2,960 / $1.85 - 150 email credits
 }
 
-# Verification credit top-ups - separate pool from scraper credits. Priced the same
-# as scraper packs (base cost + $0.05 margin per pack); adjust independently once real
-# Reoon per-verification cost is known.
+# Verification credit top-ups - separate pool from scraper credits.
+# Real cost basis (Reoon, per verification): ~$0.0013/credit, confirmed linear
+# across 10/100/150 volumes - roughly 9x cheaper per unit than scraping.
+# Same flat $0.05 margin per pack as scraper credits.
 VERIFICATION_CREDIT_PACKS = {
-    "small": {"credits": 10, "amount_ngn": 25600, "amount_usd": 16},
-    "medium": {"credits": 50, "amount_ngn": 104000, "amount_usd": 65},
-    "large": {"credits": 150, "amount_ngn": 328000, "amount_usd": 205}
+    "small": {"credits": 10, "amount_ngn": 10000, "amount_usd": 6},     # ₦100 / $0.06 - 10 verification credits
+    "medium": {"credits": 50, "amount_ngn": 18500, "amount_usd": 12},   # ₦185 / $0.12 - 50 verification credits
+    "large": {"credits": 150, "amount_ngn": 39000, "amount_usd": 25}    # ₦390 / $0.25 - 150 verification credits
 }
 
 PLANS = {
