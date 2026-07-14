@@ -151,6 +151,35 @@ async def admin_check(user=Depends(require_admin)):
     # show the Admin nav item at all. Does NOT grant access to any real admin data.
     return {"is_admin": True}
 
+@app.get("/admin/alerts-summary")
+async def admin_alerts_summary(user=Depends(require_admin)):
+    # Email-only (no PIN) - this is just a glance-able badge count, same sensitivity
+    # level as /admin/check. Real ticket/payment content still requires unlocking.
+    try:
+        open_tickets = supabase_admin.table("support_tickets").select(
+            "id", count="exact"
+        ).eq("status", "open").execute()
+        open_tickets_count = open_tickets.count or 0
+    except Exception as e:
+        logger.error("admin_alerts_summary open_tickets query failed: " + str(e))
+        open_tickets_count = 0
+
+    try:
+        since = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+        recent_payments = supabase_admin.table("payments").select(
+            "id", count="exact"
+        ).eq("status", "success").gte("created_at", since).execute()
+        recent_payments_count = recent_payments.count or 0
+    except Exception as e:
+        logger.error("admin_alerts_summary payments query failed: " + str(e))
+        recent_payments_count = 0
+
+    return {
+        "open_tickets": open_tickets_count,
+        "recent_payments_24h": recent_payments_count,
+        "total": open_tickets_count + recent_payments_count
+    }
+
 @app.post("/admin/verify-pin")
 async def verify_admin_pin(data: AdminPinModel, user=Depends(require_admin)):
     admin_pin = os.getenv("ADMIN_PIN", "")
@@ -231,18 +260,18 @@ class InitiatePaymentModel(BaseModel):
     currency: str = "NGN"
 
 CREDIT_PACKS = {
-    "small": {"credits": 10, "amount_ngn": 17600, "amount_usd": 11},     # ₦176 / $0.11 - 10 email credits
-    "medium": {"credits": 50, "amount_ngn": 96000, "amount_usd": 60},    # ₦960 / $0.60 - 50 email credits
-    "large": {"credits": 150, "amount_ngn": 320000, "amount_usd": 200}   # ₦3,200 / $2.00 - 150 email credits
+    "small": {"credits": 10, "amount_ngn": 25600, "amount_usd": 16},     # ₦256 / $0.16 - 10 email credits (base cost + $0.05 margin)
+    "medium": {"credits": 50, "amount_ngn": 104000, "amount_usd": 65},   # ₦1,040 / $0.65 - 50 email credits (base cost + $0.05 margin)
+    "large": {"credits": 150, "amount_ngn": 328000, "amount_usd": 205}   # ₦3,280 / $2.05 - 150 email credits (base cost + $0.05 margin)
 }
 
 # Verification credit top-ups - separate pool from scraper credits. Priced the same
-# as scraper packs for now as a placeholder; adjust independently once real Reoon
-# per-verification cost is known.
+# as scraper packs (base cost + $0.05 margin per pack); adjust independently once real
+# Reoon per-verification cost is known.
 VERIFICATION_CREDIT_PACKS = {
-    "small": {"credits": 10, "amount_ngn": 17600, "amount_usd": 11},
-    "medium": {"credits": 50, "amount_ngn": 96000, "amount_usd": 60},
-    "large": {"credits": 150, "amount_ngn": 320000, "amount_usd": 200}
+    "small": {"credits": 10, "amount_ngn": 25600, "amount_usd": 16},
+    "medium": {"credits": 50, "amount_ngn": 104000, "amount_usd": 65},
+    "large": {"credits": 150, "amount_ngn": 328000, "amount_usd": 205}
 }
 
 PLANS = {
@@ -441,6 +470,17 @@ async def get_stats(user=Depends(get_current_user)):
         quota = await get_scraper_quota(uid)
         verify_quota = await get_verification_quota(uid)
 
+        profile = supabase_admin.table("users").select(
+            "plan, contacts_limit, campaigns_limit"
+        ).eq("id", uid).single().execute()
+        pdata = profile.data or {}
+        plan = (pdata.get("plan") or "free").lower()
+        plan_fallback = {"free": {"contacts_limit": 500, "campaigns_limit": 5},
+                          "personal": {"contacts_limit": 20000, "campaigns_limit": 25},
+                          "corporate": {"contacts_limit": 70000, "campaigns_limit": 50}}
+        contacts_limit = pdata.get("contacts_limit") or plan_fallback.get(plan, plan_fallback["free"])["contacts_limit"]
+        campaigns_limit = pdata.get("campaigns_limit") or plan_fallback.get(plan, plan_fallback["free"])["campaigns_limit"]
+
         return {
             "campaigns": campaigns.count or 0,
             "contacts": contacts.count or 0,
@@ -451,7 +491,10 @@ async def get_stats(user=Depends(get_current_user)):
             "scraper_limit": quota["limit"],
             "scraper_bonus_credits": quota["bonus_credits"],
             "verification_used": verify_quota["used"],
-            "verification_limit": verify_quota["limit"]
+            "verification_limit": verify_quota["limit"],
+            "verification_bonus_credits": verify_quota["bonus_credits"],
+            "contacts_limit": contacts_limit,
+            "campaigns_limit": campaigns_limit
         }
     except Exception:
         return {"campaigns": 0, "contacts": 0, "emails_sent": 0, "replies": 0, "unread_replies": 0, "scraper_used": 0, "scraper_limit": 4}
@@ -1315,12 +1358,11 @@ async def check_replies(user=Depends(get_current_user)):
 
 @app.get("/inbox/replies/{reply_id}/suggested-reply")
 async def suggested_reply(reply_id: str, user=Depends(get_current_user)):
-    """Drafts a suggested follow-up reply. Because the Gmail connection only requests
-    gmail.metadata (headers + snippet, no body - see GMAIL_SCOPES), MailFlow cannot read
-    what the contact actually wrote back. This draft is built from the ORIGINAL outreach
-    email MailFlow already has stored (emails_sent.body), not from the reply's content.
-    The frontend should present this as a starting point to edit, and should recommend
-    opening the real thread in Gmail (which has full body access) as the primary action.
+    """Drafts a suggested follow-up reply, built from the ORIGINAL outreach email
+    MailFlow already has stored (emails_sent.body), as a starting point to edit.
+    NOTE: now that the Cloudflare webhook captures full reply bodies (r.get('body')),
+    this could be upgraded to draft from the actual reply content instead of just the
+    original outreach - not done yet, flagging for a future pass.
     """
     reply = supabase_admin.table("replies").select("*").eq("id", reply_id).eq("user_id", user.id).single().execute()
     if not reply.data:
