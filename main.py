@@ -185,11 +185,12 @@ async def admin_alerts_summary(since: Optional[str] = None, user=Depends(require
     running_low = 0
     try:
         near_limit_users = supabase_admin.table("users").select(
-            "id, plan, scraper_used_this_month, scraper_limit, verification_used_this_month, verification_limit"
+            "id, plan, scraper_used_this_month, scraper_limit, verification_used_this_month"
         ).neq("plan", "free").execute()
         for u in (near_limit_users.data or []):
             s_used, s_limit = u.get("scraper_used_this_month") or 0, u.get("scraper_limit") or 0
-            v_used, v_limit = u.get("verification_used_this_month") or 0, u.get("verification_limit") or 0
+            v_used = u.get("verification_used_this_month") or 0
+            v_limit = s_limit  # verification limit always mirrors scraper limit by design - no separate column
             if (s_limit and s_used >= s_limit * 0.9) or (v_limit and v_used >= v_limit * 0.9):
                 running_low += 1
     except Exception as e:
@@ -2218,10 +2219,14 @@ async def admin_adjust_credits(data: AdjustCreditsModel, admin_user=Depends(requ
     new_scraper_bonus = max((user_row.data.get("scraper_bonus_credits") or 0) + data.scraper_bonus_delta, 0)
     new_verification_bonus = max((user_row.data.get("verification_bonus_credits") or 0) + data.verification_bonus_delta, 0)
 
-    supabase_admin.table("users").update({
-        "scraper_bonus_credits": new_scraper_bonus,
-        "verification_bonus_credits": new_verification_bonus
-    }).eq("id", user_id).execute()
+    try:
+        supabase_admin.table("users").update({
+            "scraper_bonus_credits": new_scraper_bonus,
+            "verification_bonus_credits": new_verification_bonus
+        }).eq("id", user_id).execute()
+    except Exception as e:
+        logger.error(f"admin_adjust_credits update failed for {data.user_email}: " + str(e))
+        raise HTTPException(status_code=500, detail=f"Update failed - likely a missing column. Raw error: {str(e)}")
 
     logger.info(f"Admin credit adjustment for {data.user_email}: scraper {data.scraper_bonus_delta:+d} -> {new_scraper_bonus}, "
                 f"verification {data.verification_bonus_delta:+d} -> {new_verification_bonus}. Reason: {data.reason}")
