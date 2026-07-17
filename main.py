@@ -2075,7 +2075,7 @@ async def verify_payment(reference: str, user=Depends(get_current_user)):
                     }).eq("id", user.id).execute()
                 except Exception as e:
                     logger.error(f"CREDIT GRANT FAILED after payment recorded! reference={reference} user={user.id} credits={credits} type=scraper error=" + str(e))
-                    return {"message": "Payment received, but crediting your account failed - contact support with this reference: " + reference, "credit_grant_failed": True}
+                    return {"message": f"Payment received, but crediting your account failed - contact support with this reference: {reference}\n\nDebug detail: {str(e)}", "credit_grant_failed": True, "debug_error": str(e)}
                 return {
                     "message": f"✅ {credits} scraper credits added to your account!",
                     "credits_added": credits,
@@ -2094,7 +2094,7 @@ async def verify_payment(reference: str, user=Depends(get_current_user)):
                     }).eq("id", user.id).execute()
                 except Exception as e:
                     logger.error(f"CREDIT GRANT FAILED after payment recorded! reference={reference} user={user.id} credits={credits} type=verification error=" + str(e))
-                    return {"message": "Payment received, but crediting your account failed - contact support with this reference: " + reference, "credit_grant_failed": True}
+                    return {"message": f"Payment received, but crediting your account failed - contact support with this reference: {reference}\n\nDebug detail: {str(e)}", "credit_grant_failed": True, "debug_error": str(e)}
                 return {
                     "message": f"✅ {credits} verification credits added to your account!",
                     "credits_added": credits,
@@ -2346,6 +2346,36 @@ GMAIL_SCOPES = [
 # new/re connections. If you want it fully gone for existing users, they'd need to
 # disconnect and reconnect Gmail (or revoke access at myaccount.google.com/permissions).
 
+OAUTH_STATE_TTL_SECONDS = 10 * 60  # 10 minutes - plenty for a user to complete Google's consent screen
+
+def _make_oauth_state(user_id: str) -> str:
+    """Signed, expiring state token - NOT the raw user_id. Prevents an attacker who
+    completes their own real Google OAuth consent from swapping in someone else's
+    user_id in the callback and linking their Gmail account into a victim's MailFlows
+    account (classic OAuth state-CSRF). Reuses the same HMAC pattern as admin sessions."""
+    expires_at = int((datetime.utcnow() + timedelta(seconds=OAUTH_STATE_TTL_SECONDS)).timestamp())
+    payload = f"{user_id}:{expires_at}"
+    sig = hmac.new(_admin_session_secret().encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{payload}:{sig}".encode()).decode()
+
+def _verify_oauth_state(state: str) -> Optional[str]:
+    """Returns the user_id if the state token is valid and unexpired, else None."""
+    try:
+        decoded = base64.urlsafe_b64decode(state.encode()).decode()
+        parts = decoded.split(":")
+        if len(parts) != 3:
+            return None
+        user_id, expires_at, sig = parts
+        payload = f"{user_id}:{expires_at}"
+        expected_sig = hmac.new(_admin_session_secret().encode(), payload.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected_sig):
+            return None
+        if int(expires_at) < int(datetime.utcnow().timestamp()):
+            return None
+        return user_id
+    except Exception:
+        return None
+
 class GmailAccountLabel(BaseModel):
     label: str = "Gmail"
     daily_limit: int = 490
@@ -2361,7 +2391,7 @@ async def google_auth(user=Depends(get_current_user)):
         "scope": " ".join(GMAIL_SCOPES),
         "access_type": "offline",
         "prompt": "consent",
-        "state": user.id,  # Pass user_id as state
+        "state": _make_oauth_state(user.id),  # signed + expiring, not the raw user_id
     }
     auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
     return {"auth_url": auth_url}
@@ -2371,6 +2401,10 @@ async def google_auth(user=Depends(get_current_user)):
 async def google_callback(code: str, state: str):
     from fastapi.responses import RedirectResponse
     import httpx
+
+    verified_user_id = _verify_oauth_state(state)
+    if not verified_user_id:
+        return RedirectResponse(url=FRONTEND_URL + "?gmail_error=invalid_or_expired_state")
 
     # Exchange code for tokens
     try:
@@ -2417,8 +2451,8 @@ async def google_callback(code: str, state: str):
             )
 
         # Store in database
+        user_id = verified_user_id
         expires_at = (datetime.utcnow() + timedelta(seconds=expires_in)).isoformat()
-        user_id = state  # state contains user_id
 
         try:
             # Check if already exists
