@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Request, UploadFile, File
+from fastapi.responses import JSONResponse
 import uuid
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -27,6 +28,19 @@ app.add_middleware(
     expose_headers=["*"],
     max_age=600,
 )
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    # Safety net for the whole app: without this, an unhandled exception in any route
+    # can surface as an opaque, sometimes-empty error response with no detail anywhere
+    # except server logs - exactly the "empty 400 body" mystery hit while debugging the
+    # inbound-reply webhook. Now every unhandled error is logged AND returns real JSON,
+    # so nothing fails silently or untraceably again.
+    logger.error(f"UNHANDLED EXCEPTION on {request.method} {request.url.path}: {str(exc)}")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Unexpected server error: {str(exc)}"}
+    )
 
 supabase: Client = create_client(
     os.getenv("SUPABASE_URL"),
@@ -1261,36 +1275,49 @@ async def inbound_reply_webhook(data: InboundReplyModel, request: Request):
     secret = request.headers.get("X-Webhook-Secret", "")
     expected = os.getenv("INBOUND_WEBHOOK_SECRET", "")
     if not expected or not hmac.compare_digest(secret, expected):
+        logger.error("Inbound reply webhook: signature mismatch for email_id " + str(data.email_id))
         raise HTTPException(status_code=401, detail="Invalid webhook signature")
 
-    sent = supabase_admin.table("emails_sent").select("user_id, campaign_id, to_email").eq(
-        "id", data.email_id
-    ).single().execute()
-    if not sent.data:
-        # Not necessarily an error - could be an old email from before this system existed,
-        # or a bounce/auto-reply we don't need to keep. Just acknowledge and drop it.
-        logger.info("Inbound reply for unknown email_id " + data.email_id + " - dropped")
-        return {"message": "No matching sent email - dropped"}
+    try:
+        # Plain select instead of .single() - .single() throws a hard error (not just
+        # an empty result) when zero or multiple rows match, and this whole endpoint
+        # had NO error handling around it at all. A single unmatched reply could crash
+        # this handler with an opaque error and no useful log line - exactly the kind
+        # of "empty 400, no detail" failure seen in testing.
+        sent = supabase_admin.table("emails_sent").select("user_id, campaign_id, to_email").eq(
+            "id", data.email_id
+        ).execute()
 
-    body = data.text_body or data.html_body or ""
-    logger.info(
-        "Inbound reply received for " + data.email_id +
-        " - text_body len: " + str(len(data.text_body or "")) +
-        ", html_body len: " + str(len(data.html_body or "")) +
-        ", stored body len: " + str(len(body))
-    )
-    supabase_admin.table("replies").insert({
-        "user_id": sent.data["user_id"],
-        "campaign_id": sent.data.get("campaign_id"),
-        "from_email": data.from_email,
-        "from_name": data.from_name,
-        "subject": data.subject,
-        "body": body,
-        "is_read": False,
-        "received_at": datetime.utcnow().isoformat()
-    }).execute()
+        if not sent.data:
+            logger.info("Inbound reply for unknown email_id " + str(data.email_id) + " - no matching sent email, dropped")
+            return {"message": "No matching sent email - dropped"}
 
-    return {"message": "Reply recorded"}
+        sent_row = sent.data[0]
+        body = data.text_body or data.html_body or ""
+        logger.info(
+            "Inbound reply received for " + str(data.email_id) +
+            " - text_body len: " + str(len(data.text_body or "")) +
+            ", html_body len: " + str(len(data.html_body or "")) +
+            ", stored body len: " + str(len(body))
+        )
+        supabase_admin.table("replies").insert({
+            "user_id": sent_row["user_id"],
+            "campaign_id": sent_row.get("campaign_id"),
+            "from_email": data.from_email,
+            "from_name": data.from_name,
+            "subject": data.subject,
+            "body": body,
+            "is_read": False,
+            "received_at": datetime.utcnow().isoformat()
+        }).execute()
+
+        return {"message": "Reply recorded"}
+
+    except Exception as e:
+        # Never let this crash unhandled - always return real, loggable detail so a
+        # failed reply is diagnosable from Render logs alone, not a mystery blank error.
+        logger.error(f"Inbound reply webhook FAILED for email_id={data.email_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to process reply: {str(e)}")
 
 @app.post("/gmail/check-replies")
 async def check_replies(user=Depends(get_current_user)):
@@ -2050,7 +2077,7 @@ async def verify_payment(reference: str, user=Depends(get_current_user)):
             currency = result["data"]["currency"]
 
             if metadata.get("type") == "indepth_search_topup":
-                credits = metadata.get("credits", 0)
+                credits = int(metadata.get("credits", 0) or 0)  # Paystack sometimes echoes metadata numbers back as strings - never trust the type
                 if not _record_payment_once(user.id, "indepth_search_topup", amount, currency, reference):
                     return {"message": "This payment was already processed - no changes made.", "already_processed": True}
                 profile = supabase_admin.table("users").select("findymail_credits").eq("id", user.id).single().execute()
@@ -2065,7 +2092,7 @@ async def verify_payment(reference: str, user=Depends(get_current_user)):
                 }
 
             if metadata.get("type") == "credit_topup":
-                credits = metadata.get("credits", 0)
+                credits = int(metadata.get("credits", 0) or 0)  # Paystack sometimes echoes metadata numbers back as strings - never trust the type
                 if not _record_payment_once(user.id, "credit_topup_" + metadata.get("pack", ""), amount, currency, reference):
                     return {"message": "This payment was already processed - no changes made.", "already_processed": True}
                 try:
@@ -2084,7 +2111,7 @@ async def verify_payment(reference: str, user=Depends(get_current_user)):
                 }
 
             if metadata.get("type") == "verification_credit_topup":
-                credits = metadata.get("credits", 0)
+                credits = int(metadata.get("credits", 0) or 0)  # Paystack sometimes echoes metadata numbers back as strings - never trust the type
                 if not _record_payment_once(user.id, "verification_credit_topup_" + metadata.get("pack", ""), amount, currency, reference):
                     return {"message": "This payment was already processed - no changes made.", "already_processed": True}
                 try:
@@ -2150,7 +2177,7 @@ async def paystack_webhook(request: Request):
             currency = data.get("currency")
 
             if metadata.get("type") == "indepth_search_topup" and user_id and reference:
-                credits = metadata.get("credits", 0)
+                credits = int(metadata.get("credits", 0) or 0)  # Paystack sometimes echoes metadata numbers back as strings - never trust the type
                 if _record_payment_once(user_id, "indepth_search_topup", amount, currency, reference):
                     profile = supabase_admin.table("users").select("findymail_credits").eq("id", user_id).single().execute()
                     current_credits = (profile.data or {}).get("findymail_credits") or 0
@@ -2160,7 +2187,7 @@ async def paystack_webhook(request: Request):
                 return {"status": "ok"}
 
             if metadata.get("type") == "credit_topup" and user_id and reference:
-                credits = metadata.get("credits", 0)
+                credits = int(metadata.get("credits", 0) or 0)  # Paystack sometimes echoes metadata numbers back as strings - never trust the type
                 if _record_payment_once(user_id, "credit_topup_" + metadata.get("pack", ""), amount, currency, reference):
                     profile = supabase_admin.table("users").select("scraper_bonus_credits").eq("id", user_id).single().execute()
                     current_bonus = (profile.data or {}).get("scraper_bonus_credits") or 0
@@ -2170,7 +2197,7 @@ async def paystack_webhook(request: Request):
                 return {"status": "ok"}
 
             if metadata.get("type") == "verification_credit_topup" and user_id and reference:
-                credits = metadata.get("credits", 0)
+                credits = int(metadata.get("credits", 0) or 0)  # Paystack sometimes echoes metadata numbers back as strings - never trust the type
                 if _record_payment_once(user_id, "verification_credit_topup_" + metadata.get("pack", ""), amount, currency, reference):
                     profile = supabase_admin.table("users").select("verification_bonus_credits").eq("id", user_id).single().execute()
                     current_bonus = (profile.data or {}).get("verification_bonus_credits") or 0
@@ -2268,7 +2295,7 @@ async def admin_reconcile_payment(data: ReconcilePaymentModel, admin_user=Depend
     currency = result["data"]["currency"]
 
     if metadata.get("type") == "indepth_search_topup":
-        credits = metadata.get("credits", 0)
+        credits = int(metadata.get("credits", 0) or 0)  # Paystack sometimes echoes metadata numbers back as strings - never trust the type
         if not _record_payment_once(user_id, "indepth_search_topup", amount, currency, data.reference):
             return {"message": "Already processed - nothing to do.", "already_processed": True}
         profile = supabase_admin.table("users").select("findymail_credits").eq("id", user_id).single().execute()
@@ -2277,7 +2304,7 @@ async def admin_reconcile_payment(data: ReconcilePaymentModel, admin_user=Depend
         return {"message": f"Granted {credits} in-depth search credits."}
 
     if metadata.get("type") == "credit_topup":
-        credits = metadata.get("credits", 0)
+        credits = int(metadata.get("credits", 0) or 0)  # Paystack sometimes echoes metadata numbers back as strings - never trust the type
         if not _record_payment_once(user_id, "credit_topup_" + metadata.get("pack", ""), amount, currency, data.reference):
             return {"message": "Already processed - nothing to do.", "already_processed": True}
         profile = supabase_admin.table("users").select("scraper_bonus_credits").eq("id", user_id).single().execute()
@@ -2286,7 +2313,7 @@ async def admin_reconcile_payment(data: ReconcilePaymentModel, admin_user=Depend
         return {"message": f"Granted {credits} scraper credits."}
 
     if metadata.get("type") == "verification_credit_topup":
-        credits = metadata.get("credits", 0)
+        credits = int(metadata.get("credits", 0) or 0)  # Paystack sometimes echoes metadata numbers back as strings - never trust the type
         if not _record_payment_once(user_id, "verification_credit_topup_" + metadata.get("pack", ""), amount, currency, data.reference):
             return {"message": "Already processed - nothing to do.", "already_processed": True}
         profile = supabase_admin.table("users").select("verification_bonus_credits").eq("id", user_id).single().execute()
