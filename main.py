@@ -2737,6 +2737,7 @@ class GmailSendModel(BaseModel):
     subject: str
     body: str
     from_name: str = None
+    campaign_id: Optional[str] = None  # lets Quick Send link its email to its own tracking campaign row
 
 class GenerateEmailModel(BaseModel):
     context: str
@@ -2978,7 +2979,7 @@ async def gmail_send(data: GmailSendModel, user=Depends(get_current_user)):
         supabase_admin.table("emails_sent").insert({
             "id": email_id,
             "user_id": user.id,
-            "campaign_id": None,
+            "campaign_id": data.campaign_id,
             "to_email": data.to_email,
             "to_name": None,
             "subject": data.subject,
