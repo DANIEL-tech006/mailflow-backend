@@ -394,7 +394,19 @@ async def register(data: RegisterModel):
                     "full_name": data.full_name,
                     "plan": "free",
                     "daily_limit": 100,
-                    "emails_sent_today": 0
+                    "emails_sent_today": 0,
+                    # Explicitly set every plan limit from PLANS["free"] instead of
+                    # relying on the users table's raw column defaults - those
+                    # defaults had drifted out of sync (scraper_limit defaulted to
+                    # 10 instead of the intended 4), silently giving every new free
+                    # signup the wrong limit. Setting these explicitly here makes
+                    # signup the single source of truth, matching PLANS exactly.
+                    "scraper_limit": PLANS["free"]["scraper_limit"],
+                    "contacts_limit": PLANS["free"]["contacts_limit"],
+                    "campaigns_limit": PLANS["free"]["campaigns_limit"],
+                    "smtp_limit": PLANS["free"]["smtp_limit"],
+                    "scraper_bonus_credits": 0,
+                    "verification_bonus_credits": 0
                 }).execute()
             except Exception:
                 pass
@@ -1218,7 +1230,7 @@ async def send_bulk_emails(campaign: dict, contacts: list, smtp_accounts: list, 
             if campaign.get("reply_to"):
                 msg["Reply-To"] = campaign["reply_to"]
             tracking_id = campaign["id"] + "-" + contact["id"]
-            base_url = "https://web-production-dd320.up.railway.app"
+            base_url = BACKEND_BASE_URL
             pixel = '<img src="' + base_url + '/track/' + tracking_id + '" width="1" height="1">'
             html_body = body + "<br><br>" + pixel + "<br><small>To unsubscribe, reply UNSUBSCRIBE</small>"
             msg.attach(MIMEText(html_body, "html"))
@@ -2356,6 +2368,12 @@ GOOGLE_REDIRECT_URI = os.getenv(
     "https://web-production-dd320.up.railway.app/auth/google/callback"
 )
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://effervescent-nasturtium-6a71c2.netlify.app")
+# Used to build the open-tracking pixel URL. This was previously hardcoded to a dead
+# Railway URL in two places, which silently made open-tracking impossible - the pixel
+# <img> tag pointed at a host that no longer responds, so it could never fire. Set this
+# on whichever backend host is actually live; update it there each time you switch hosts
+# instead of needing a code change.
+BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "https://mailflow-backend-68gn.onrender.com")
 
 GMAIL_SCOPES = [
     "https://www.googleapis.com/auth/gmail.send",
@@ -2549,10 +2567,30 @@ async def google_callback(code: str, state: str):
 @app.get("/gmail/accounts")
 async def list_gmail_accounts(user=Depends(get_current_user)):
     result = supabase_admin.table("gmail_accounts").select(
-        "id, gmail_address, display_name, is_active, sent_today, daily_limit, last_used_at, last_reset_date, created_at"
+        "id, gmail_address, display_name, is_active, sent_today, daily_limit, last_used_at, last_reset_date, created_at, hidden_from_ui"
     ).eq("user_id", user.id).execute()
     accounts = await reset_gmail_daily_counts(result.data or [])
+    # Hidden accounts still exist in the DB (needed for the 10-hour reconnect
+    # cooldown to keep working correctly) - just don't show them in the list.
+    accounts = [a for a in accounts if not a.get("hidden_from_ui")]
     return accounts
+
+@app.patch("/gmail/accounts/{account_id}/hide")
+async def hide_gmail_account(account_id: str, user=Depends(get_current_user)):
+    # Purely cosmetic - only removes a disconnected account from view. Does NOT
+    # affect the 10-hour reconnect cooldown, which still checks disconnected_at
+    # on ALL accounts regardless of this flag.
+    existing = supabase_admin.table("gmail_accounts").select("is_active").eq(
+        "id", account_id
+    ).eq("user_id", user.id).single().execute()
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Account not found")
+    if existing.data.get("is_active"):
+        raise HTTPException(status_code=400, detail="Disconnect this account first before deleting it from view")
+    supabase_admin.table("gmail_accounts").update({"hidden_from_ui": True}).eq(
+        "id", account_id
+    ).eq("user_id", user.id).execute()
+    return {"message": "Removed from view"}
 
 # ── Step 4: Delete Gmail account ──
 GMAIL_RECONNECT_COOLDOWN_HOURS = 10
@@ -2965,6 +3003,10 @@ async def gmail_send(data: GmailSendModel, user=Depends(get_current_user)):
     html_body = data.body.replace("\n", "<br>")
     email_id = str(uuid.uuid4())
     tracking_reply_to = account["gmail_address"] + ", reply+" + email_id + "@mailflows.org"
+    # Quick Send previously had no open-tracking at all - every sent email always
+    # showed 0 opens no matter what. Added the same pixel bulk campaigns use.
+    pixel = '<img src="' + BACKEND_BASE_URL + '/track/' + email_id + '" width="1" height="1">'
+    html_body = html_body + pixel
 
     try:
         send_result = await send_via_gmail_api(
@@ -2987,6 +3029,7 @@ async def gmail_send(data: GmailSendModel, user=Depends(get_current_user)):
             "status": "sent",
             "thread_id": send_result.get("thread_id"),
             "gmail_account_id": account["id"],
+            "tracking_pixel_id": email_id,
         }).execute()
         return {"message": "Email sent successfully to " + data.to_email, "status": "ok"}
     except Exception as e:
@@ -3110,7 +3153,7 @@ async def send_bulk_via_gmail(
             )
 
             tracking_id = campaign["id"] + "-" + contact["id"]
-            base_url = "https://web-production-dd320.up.railway.app"
+            base_url = BACKEND_BASE_URL
             pixel = '<img src="' + base_url + '/track/' + tracking_id + '" width="1" height="1">'
             html_body = body + "<br><br>" + pixel + \
                         "<br><small>To unsubscribe, reply UNSUBSCRIBE</small>"
