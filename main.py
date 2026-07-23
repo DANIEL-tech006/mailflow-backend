@@ -352,19 +352,80 @@ FREE_PLAN = {
 
 @app.post("/payments/downgrade")
 async def downgrade_to_free(user=Depends(get_current_user)):
-    """Self-serve downgrade - no support ticket needed. Takes effect immediately
-    (MVP behavior - if you later want it to wait until the paid period ends,
-    check plan_expires_at here instead of downgrading right away)."""
+    """Schedules a downgrade to Free for the end of the current billing period -
+    the person keeps their current plan's features until then, since they already
+    paid for that time. If they're already on Free, or have no active billing
+    period, it applies immediately since there's nothing to preserve."""
+    return await _schedule_plan_change(user.id, "free")
+
+class ScheduleDowngradeModel(BaseModel):
+    target_plan: str  # "free", "personal", or "corporate"
+
+@app.post("/payments/schedule-downgrade")
+async def schedule_downgrade(data: ScheduleDowngradeModel, user=Depends(get_current_user)):
+    """General-purpose scheduled plan change - handles paid-to-paid downgrades
+    (e.g. Corporate -> Personal) the same fair way as the Free downgrade, so this
+    never needs a manual support ticket or admin intervention."""
+    if data.target_plan not in ("free", "personal", "corporate"):
+        raise HTTPException(status_code=400, detail="Invalid target plan")
+    return await _schedule_plan_change(user.id, data.target_plan)
+
+async def _schedule_plan_change(user_id: str, target_plan: str):
+    profile = supabase_admin.table("users").select("plan, plan_expires_at").eq("id", user_id).single().execute()
+    current_plan = (profile.data or {}).get("plan", "free")
+    expires_at = (profile.data or {}).get("plan_expires_at")
+
+    if current_plan == target_plan:
+        return {"message": f"You're already on the {target_plan} plan.", "plan": current_plan}
+
+    # Nothing paid-for to preserve - apply immediately (covers Free users "downgrading"
+    # to Free, which shouldn't happen via UI anyway, and accounts with no billing period)
+    is_still_within_paid_period = expires_at and datetime.fromisoformat(expires_at.replace("Z", "+00:00")).replace(tzinfo=None) > datetime.utcnow()
+    if current_plan == "free" or not is_still_within_paid_period:
+        await _apply_plan_change(user_id, target_plan)
+        return {"message": f"You've been moved to the {target_plan.capitalize()} plan.", "plan": target_plan}
+
+    supabase_admin.table("users").update({"pending_plan_change": target_plan}).eq("id", user_id).execute()
+    return {
+        "message": f"Scheduled: you'll move to the {target_plan.capitalize()} plan on {expires_at[:10]}. "
+                    f"Your current plan's features stay active until then - you already paid for this period.",
+        "scheduled_for": expires_at,
+        "target_plan": target_plan
+    }
+
+async def _apply_plan_change(user_id: str, target_plan: str):
+    if target_plan == "free":
+        limits = FREE_PLAN
+    else:
+        limits = PLANS[target_plan]
     supabase_admin.table("users").update({
-        "plan": "free",
-        "daily_limit": FREE_PLAN["daily_limit"],
-        "contacts_limit": FREE_PLAN["contacts_limit"],
-        "smtp_limit": FREE_PLAN["smtp_limit"],
-        "scraper_limit": FREE_PLAN["scraper_limit"],
-        "campaigns_limit": FREE_PLAN["campaigns_limit"],
-        "plan_expires_at": None,
-    }).eq("id", user.id).execute()
-    return {"message": "You've been moved to the Free plan.", "plan": "free"}
+        "plan": target_plan,
+        "daily_limit": limits["daily_limit"],
+        "contacts_limit": limits["contacts_limit"],
+        "smtp_limit": limits["smtp_limit"],
+        "scraper_limit": limits["scraper_limit"],
+        "campaigns_limit": limits["campaigns_limit"],
+        "plan_expires_at": None if target_plan == "free" else (datetime.utcnow() + timedelta(days=30)).isoformat(),
+        "pending_plan_change": None,
+    }).eq("id", user_id).execute()
+
+async def maybe_apply_pending_plan_change(user_id: str):
+    """Lazily checks and applies a scheduled downgrade once its billing period has
+    actually ended - same lazy-check pattern already used for monthly credit resets
+    elsewhere in this file, since there's no cron/scheduler infrastructure yet."""
+    try:
+        profile = supabase_admin.table("users").select(
+            "plan, plan_expires_at, pending_plan_change"
+        ).eq("id", user_id).single().execute()
+        data = profile.data or {}
+        pending = data.get("pending_plan_change")
+        expires_at = data.get("plan_expires_at")
+        if pending and expires_at:
+            expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00")).replace(tzinfo=None)
+            if expiry <= datetime.utcnow():
+                await _apply_plan_change(user_id, pending)
+    except Exception as e:
+        logger.error("maybe_apply_pending_plan_change failed for " + user_id + ": " + str(e))
 
 @app.get("/")
 def root():
@@ -487,6 +548,7 @@ async def login(data: LoginModel):
 @app.get("/auth/me")
 async def get_me(user=Depends(get_current_user)):
     try:
+        await maybe_apply_pending_plan_change(user.id)
         profile = supabase_admin.table("users").select("*").eq("id", user.id).single().execute()
         return profile.data
     except Exception:
