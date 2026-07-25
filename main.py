@@ -412,18 +412,34 @@ async def _apply_plan_change(user_id: str, target_plan: str):
 async def maybe_apply_pending_plan_change(user_id: str):
     """Lazily checks and applies a scheduled downgrade once its billing period has
     actually ended - same lazy-check pattern already used for monthly credit resets
-    elsewhere in this file, since there's no cron/scheduler infrastructure yet."""
+    elsewhere in this file, since there's no cron/scheduler infrastructure yet.
+
+    ALSO handles plain expiry: MailFlows doesn't have true recurring billing (that
+    would need Paystack's Subscriptions API + webhook handling for renewal charges,
+    which isn't built). Each payment just buys 30 days. So "the person didn't pay
+    again" and "the person's card failed" look identical here: plan_expires_at simply
+    passes with no new payment recorded. Either way, once it passes, they fall back
+    to Free automatically - same practical outcome as failed-billing auto-downgrade,
+    just without needing a real recurring-charge system behind it."""
     try:
         profile = supabase_admin.table("users").select(
             "plan, plan_expires_at, pending_plan_change"
         ).eq("id", user_id).single().execute()
         data = profile.data or {}
+        plan = data.get("plan", "free")
         pending = data.get("pending_plan_change")
         expires_at = data.get("plan_expires_at")
-        if pending and expires_at:
-            expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00")).replace(tzinfo=None)
-            if expiry <= datetime.utcnow():
-                await _apply_plan_change(user_id, pending)
+        if not expires_at:
+            return
+        expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00")).replace(tzinfo=None)
+        if expiry > datetime.utcnow():
+            return
+        if pending:
+            await _apply_plan_change(user_id, pending)
+        # NOTE: plain unpaid-expiry (no pending downgrade, plan just lapsed) is now
+        # handled by process_billing() instead of here - that flow gives a real
+        # grace period with retry attempts before downgrading, rather than dropping
+        # someone to Free the instant plan_expires_at passes.
     except Exception as e:
         logger.error("maybe_apply_pending_plan_change failed for " + user_id + ": " + str(e))
 
@@ -2208,15 +2224,27 @@ async def verify_payment(reference: str, user=Depends(get_current_user)):
                 if not _record_payment_once(user.id, plan, amount, currency, reference):
                     return {"message": "This payment was already processed - no changes made.", "already_processed": True}
                 plan_data = PLANS[plan]
-                supabase_admin.table("users").update({
+                auth = result["data"].get("authorization", {}) or {}
+                update_fields = {
                     "plan": plan,
                     "daily_limit": plan_data["daily_limit"],
                     "contacts_limit": plan_data["contacts_limit"],
                     "smtp_limit": plan_data["smtp_limit"],
                     "scraper_limit": plan_data["scraper_limit"],
                     "campaigns_limit": plan_data["campaigns_limit"],
-                    "plan_expires_at": (datetime.utcnow() + timedelta(days=30)).isoformat()
-                }).eq("id", user.id).execute()
+                    "plan_expires_at": (datetime.utcnow() + timedelta(days=30)).isoformat(),
+                    "pending_plan_change": None,  # upgrading cancels any previously scheduled downgrade
+                    "billing_failed_attempts": 0,
+                    "billing_grace_started_at": None,
+                }
+                # Save a reusable card token for auto-renewal, if this payment method
+                # supports it (card payments almost always do; bank transfer/USSD don't).
+                if auth.get("reusable") and auth.get("authorization_code"):
+                    update_fields["paystack_authorization_code"] = auth["authorization_code"]
+                    customer_code = (result["data"].get("customer") or {}).get("customer_code")
+                    if customer_code:
+                        update_fields["paystack_customer_code"] = customer_code
+                supabase_admin.table("users").update(update_fields).eq("id", user.id).execute()
                 return {
                     "message": "Payment successful! " + plan_data["name"] + " plan activated.",
                     "plan": plan,
@@ -2284,15 +2312,25 @@ async def paystack_webhook(request: Request):
             if user_id and plan and plan in PLANS and reference:
                 if _record_payment_once(user_id, plan, amount, currency, reference):
                     plan_data = PLANS[plan]
-                    supabase_admin.table("users").update({
+                    auth = data.get("authorization", {}) or {}
+                    update_fields = {
                         "plan": plan,
                         "daily_limit": plan_data["daily_limit"],
                         "contacts_limit": plan_data["contacts_limit"],
                         "smtp_limit": plan_data["smtp_limit"],
                         "scraper_limit": plan_data["scraper_limit"],
                         "campaigns_limit": plan_data["campaigns_limit"],
-                        "plan_expires_at": (datetime.utcnow() + timedelta(days=30)).isoformat()
-                    }).eq("id", user_id).execute()
+                        "plan_expires_at": (datetime.utcnow() + timedelta(days=30)).isoformat(),
+                        "pending_plan_change": None,  # upgrading cancels any previously scheduled downgrade
+                        "billing_failed_attempts": 0,
+                        "billing_grace_started_at": None,
+                    }
+                    if auth.get("reusable") and auth.get("authorization_code"):
+                        update_fields["paystack_authorization_code"] = auth["authorization_code"]
+                        customer_code = (data.get("customer") or {}).get("customer_code")
+                        if customer_code:
+                            update_fields["paystack_customer_code"] = customer_code
+                    supabase_admin.table("users").update(update_fields).eq("id", user_id).execute()
     except Exception as e:
         logger.error("Webhook error: " + str(e))
     return {"status": "ok"}
@@ -2404,7 +2442,8 @@ async def admin_reconcile_payment(data: ReconcilePaymentModel, admin_user=Depend
             "plan": plan, "daily_limit": plan_data["daily_limit"], "contacts_limit": plan_data["contacts_limit"],
             "smtp_limit": plan_data["smtp_limit"], "scraper_limit": plan_data["scraper_limit"],
             "campaigns_limit": plan_data["campaigns_limit"],
-            "plan_expires_at": (datetime.utcnow() + timedelta(days=30)).isoformat()
+            "plan_expires_at": (datetime.utcnow() + timedelta(days=30)).isoformat(),
+            "pending_plan_change": None,  # upgrading cancels any previously scheduled downgrade
         }).eq("id", user_id).execute()
         return {"message": f"Activated {plan_data['name']} plan."}
 
@@ -3123,7 +3162,6 @@ async def test_gmail(data: GmailTestModel, user=Depends(get_current_user)):
 @app.post("/gmail/campaigns/{campaign_id}/send")
 async def send_gmail_campaign(
     campaign_id: str,
-    background_tasks: BackgroundTasks,
     user=Depends(get_current_user)
 ):
     camp = supabase_admin.table("campaigns").select("*").eq(
@@ -3141,12 +3179,6 @@ async def send_gmail_campaign(
             detail="No Gmail accounts connected. Go to SMTP Settings and click Connect Gmail."
         )
 
-    gmail_accounts.data = await reset_gmail_daily_counts(gmail_accounts.data)
-
-    plan_check = await check_plan_daily_limit(user.id)
-    if not plan_check["ok"]:
-        raise HTTPException(status_code=403, detail=plan_check["message"])
-
     contacts_query = supabase_admin.table("scraped_contacts").select("*").eq("user_id", user.id)
     if camp.data.get("niche"):
         niche_list = [n.strip() for n in camp.data["niche"].split(",") if n.strip()]
@@ -3162,23 +3194,294 @@ async def send_gmail_campaign(
             detail="No contacts found in this group. Use Email Scraper or Add Contact first."
         )
 
-    background_tasks.add_task(
-        send_bulk_via_gmail,
-        campaign=camp.data,
-        contacts=contacts.data,
-        gmail_accounts=gmail_accounts.data,
-        user_id=user.id
-    )
+    # Instead of looping through every contact in one long-running process (which
+    # dies if the host restarts/sleeps mid-campaign), queue one job per contact.
+    # A separate scheduled processor (POST /process-campaigns) works through these
+    # in small batches, so a restart mid-campaign just means the next scheduled
+    # run picks up exactly where it left off - nothing is lost.
+    jobs = [{
+        "campaign_id": campaign_id,
+        "user_id": user.id,
+        "contact_id": c.get("id"),
+        "to_email": c["email"],
+        "to_name": c.get("name"),
+        "status": "pending",
+        "scheduled_for": datetime.utcnow().isoformat(),
+    } for c in contacts.data]
+
+    # Insert in chunks to stay well under any request size limit
+    for i in range(0, len(jobs), 500):
+        supabase_admin.table("campaign_jobs").insert(jobs[i:i+500]).execute()
 
     supabase_admin.table("campaigns").update({
-        "status": "sending",
+        "status": "queued",
         "started_at": datetime.utcnow().isoformat()
     }).eq("id", campaign_id).execute()
 
     return {
-        "message": "Campaign started! Sending to " + str(len(contacts.data)) + " contacts via Gmail API.",
-        "status": "sending"
+        "message": f"Campaign queued! {len(contacts.data)} emails will be sent gradually over the next few minutes.",
+        "status": "queued",
+        "queued_count": len(contacts.data)
     }
+
+BILLING_GRACE_PERIOD_HOURS = 24  # one full day, as requested
+
+@app.post("/process-billing")
+async def process_billing(request: Request):
+    """Called by an external scheduler (Cloudflare Cron, a few times a day) - NOT
+    by users. Finds paid-plan accounts whose billing period has lapsed with no
+    scheduled downgrade, and tries to auto-charge their saved card. Gives a full
+    day of grace with retries before actually downgrading anyone, so a temporarily
+    declined card doesn't instantly cost someone their plan."""
+    secret = request.headers.get("X-Process-Secret", "")
+    expected = os.getenv("PROCESS_CAMPAIGNS_SECRET", "")
+    if not expected or not hmac.compare_digest(secret, expected):
+        raise HTTPException(status_code=401, detail="Invalid processor secret")
+
+    secret_key = os.getenv("PAYSTACK_SECRET_KEY")
+    now = datetime.utcnow()
+
+    lapsed = supabase_admin.table("users").select(
+        "id, email, plan, plan_expires_at, pending_plan_change, "
+        "paystack_authorization_code, billing_failed_attempts, billing_grace_started_at"
+    ).neq("plan", "free").lte("plan_expires_at", now.isoformat()).is_("pending_plan_change", "null").execute()
+
+    results = {"renewed": 0, "retried_failed": 0, "downgraded": 0, "no_card_on_file": 0}
+
+    for u in (lapsed.data or []):
+        try:
+            grace_started = u.get("billing_grace_started_at")
+            if not grace_started:
+                # First time we've seen this account overdue - start the grace clock now.
+                grace_started = now.isoformat()
+                supabase_admin.table("users").update({"billing_grace_started_at": grace_started}).eq("id", u["id"]).execute()
+
+            grace_start_dt = datetime.fromisoformat(grace_started.replace("Z", "+00:00")).replace(tzinfo=None)
+            grace_deadline = grace_start_dt + timedelta(hours=BILLING_GRACE_PERIOD_HOURS)
+
+            if now >= grace_deadline:
+                # Grace period exhausted, still not renewed - downgrade for real now.
+                await _apply_plan_change(u["id"], "free")
+                supabase_admin.table("users").update({
+                    "billing_failed_attempts": 0, "billing_grace_started_at": None
+                }).eq("id", u["id"]).execute()
+                results["downgraded"] += 1
+                continue
+
+            auth_code = u.get("paystack_authorization_code")
+            if not auth_code:
+                # No saved card to charge - they're just in grace, waiting for a
+                # manual payment. Nothing to do until either they pay or grace ends.
+                results["no_card_on_file"] += 1
+                continue
+
+            plan_data = PLANS[u["plan"]]
+            async with httpx.AsyncClient() as client:
+                charge_res = await client.post(
+                    "https://api.paystack.co/transaction/charge_authorization",
+                    headers={"Authorization": "Bearer " + secret_key},
+                    json={
+                        "authorization_code": auth_code,
+                        "email": u["email"],
+                        "amount": plan_data["amount_ngn"],
+                        "currency": "NGN",
+                    }
+                )
+            charge_result = charge_res.json()
+
+            if charge_result.get("status") and charge_result["data"]["status"] == "success":
+                reference = charge_result["data"]["reference"]
+                if _record_payment_once(u["id"], u["plan"], plan_data["amount_ngn"], "NGN", reference):
+                    supabase_admin.table("users").update({
+                        "plan_expires_at": (now + timedelta(days=30)).isoformat(),
+                        "billing_failed_attempts": 0,
+                        "billing_grace_started_at": None,
+                    }).eq("id", u["id"]).execute()
+                    results["renewed"] += 1
+            else:
+                supabase_admin.table("users").update({
+                    "billing_failed_attempts": (u.get("billing_failed_attempts") or 0) + 1
+                }).eq("id", u["id"]).execute()
+                results["retried_failed"] += 1
+                logger.info(f"Billing retry failed for {u['email']}: {charge_result.get('message')}")
+
+        except Exception as e:
+            logger.error(f"process_billing error for user {u.get('id')}: {str(e)}")
+
+    return {"message": "Billing check complete.", **results}
+
+CAMPAIGN_BATCH_SIZE = 20  # emails per processor run - small enough to finish well within a request timeout
+
+@app.post("/process-campaigns")
+async def process_campaigns(request: Request):
+    """Called by an external scheduler (Cloudflare Cron Trigger, once a minute) -
+    NOT by users. Processes a small batch of due campaign_jobs and exits. If the
+    host is asleep, this HTTP call itself wakes it; if it was mid-batch when the
+    host died, the next scheduled run just picks up whatever's still 'pending' -
+    nothing is lost, since progress lives in the database, not in server memory."""
+    secret = request.headers.get("X-Process-Secret", "")
+    expected = os.getenv("PROCESS_CAMPAIGNS_SECRET", "")
+    if not expected or not hmac.compare_digest(secret, expected):
+        raise HTTPException(status_code=401, detail="Invalid processor secret")
+
+    import asyncio
+    import random
+
+    # Pull a wider pool than one batch, then round-robin across users so a single
+    # large campaign (e.g. one user's 4,500-email send) can't hog every processor
+    # run for hours and starve everyone else's campaigns. Without this, pure FIFO-
+    # by-scheduled_for would process User A's entire campaign before User B's queue
+    # gets touched at all, since all jobs start with the same scheduled_for time.
+    pool = supabase_admin.table("campaign_jobs").select("*").eq(
+        "status", "pending"
+    ).lte("scheduled_for", datetime.utcnow().isoformat()).order(
+        "scheduled_for"
+    ).limit(CAMPAIGN_BATCH_SIZE * 15).execute()
+
+    pool_jobs = pool.data or []
+    if not pool_jobs:
+        return {"message": "No due jobs.", "processed": 0}
+
+    from collections import defaultdict
+    by_user = defaultdict(list)
+    for j in pool_jobs:
+        by_user[j["user_id"]].append(j)
+
+    jobs = []
+    while len(jobs) < CAMPAIGN_BATCH_SIZE and any(by_user.values()):
+        for uid in list(by_user.keys()):
+            if by_user[uid]:
+                jobs.append(by_user[uid].pop(0))
+                if len(jobs) >= CAMPAIGN_BATCH_SIZE:
+                    break
+    if not jobs:
+        return {"message": "No due jobs.", "processed": 0}
+
+    campaign_cache = {}
+    accounts_cache = {}
+    daily_limit_cache = {}
+    processed, sent_ok, failed = 0, 0, 0
+    touched_campaigns = set()
+
+    for job in jobs:
+        touched_campaigns.add(job["campaign_id"])
+        try:
+            # --- Load campaign (cached within this batch) ---
+            if job["campaign_id"] not in campaign_cache:
+                c = supabase_admin.table("campaigns").select("*").eq("id", job["campaign_id"]).execute()
+                campaign_cache[job["campaign_id"]] = (c.data or [None])[0]
+            campaign = campaign_cache[job["campaign_id"]]
+            if not campaign or campaign.get("status") == "cancelled":
+                supabase_admin.table("campaign_jobs").update({"status": "cancelled"}).eq("id", job["id"]).execute()
+                continue
+
+            # --- Plan daily limit check (cached per user within this batch) ---
+            if job["user_id"] not in daily_limit_cache:
+                daily_limit_cache[job["user_id"]] = await check_plan_daily_limit(job["user_id"])
+            if not daily_limit_cache[job["user_id"]]["ok"]:
+                # Push this job an hour out instead of leaving it at the front of
+                # the queue, so it doesn't block other users' jobs every run.
+                supabase_admin.table("campaign_jobs").update({
+                    "scheduled_for": (datetime.utcnow() + timedelta(hours=1)).isoformat()
+                }).eq("id", job["id"]).execute()
+                continue
+
+            # --- Pick a Gmail account with capacity (cached per user within this batch) ---
+            if job["user_id"] not in accounts_cache:
+                accs = supabase_admin.table("gmail_accounts").select("*").eq(
+                    "user_id", job["user_id"]
+                ).eq("is_active", True).execute()
+                accounts_cache[job["user_id"]] = await reset_gmail_daily_counts(accs.data or [])
+            accounts = accounts_cache[job["user_id"]]
+            account = next((a for a in accounts if a.get("sent_today", 0) < a.get("daily_limit", 490)), None)
+            if not account:
+                supabase_admin.table("campaign_jobs").update({
+                    "scheduled_for": (datetime.utcnow() + timedelta(hours=1)).isoformat()
+                }).eq("id", job["id"]).execute()
+                continue
+
+            # --- Personalize and send (same logic as the old bulk sender) ---
+            body = (campaign.get("template_body") or "").replace(
+                "{{name}}", job.get("to_name") or "there"
+            ).replace("{{company}}", "your company")
+
+            tracking_id = job["campaign_id"] + "-" + job["id"]
+            pixel = '<img src="' + BACKEND_BASE_URL + '/track/' + tracking_id + '" width="1" height="1">'
+            html_body = body + "<br><br>" + pixel + "<br><small>To unsubscribe, reply UNSUBSCRIBE</small>"
+            plain_body = body + "\n\nTo unsubscribe reply UNSUBSCRIBE"
+
+            email_id = str(uuid.uuid4())
+            tracking_reply_to = account["gmail_address"] + ", reply+" + email_id + "@mailflows.org"
+
+            send_result = await send_via_gmail_api(
+                account=account,
+                to_email=job["to_email"],
+                subject=campaign.get("subject") or "",
+                html_body=html_body,
+                plain_body=plain_body,
+                from_name=campaign.get("from_name"),
+                reply_to=tracking_reply_to,
+            )
+
+            supabase_admin.table("emails_sent").insert({
+                "id": email_id,
+                "user_id": job["user_id"],
+                "campaign_id": job["campaign_id"],
+                "to_email": job["to_email"],
+                "to_name": job.get("to_name"),
+                "subject": campaign.get("subject"),
+                "body": plain_body,
+                "status": "sent",
+                "tracking_pixel_id": tracking_id,
+                "thread_id": send_result.get("thread_id"),
+                "gmail_account_id": account["id"],
+            }).execute()
+
+            new_sent_today = account.get("sent_today", 0) + 1
+            supabase_admin.table("gmail_accounts").update({"sent_today": new_sent_today}).eq("id", account["id"]).execute()
+            account["sent_today"] = new_sent_today  # keep the in-batch cache accurate for the next job
+
+            supabase_admin.table("campaign_jobs").update({
+                "status": "sent", "sent_at": datetime.utcnow().isoformat()
+            }).eq("id", job["id"]).execute()
+            sent_ok += 1
+
+            # Small randomized delay between sends within this batch - same spirit
+            # as the old loop's anti-spam-pattern delay, just scoped to one batch now.
+            await asyncio.sleep(random.uniform(2, 5))
+
+        except Exception as e:
+            attempts = (job.get("attempts") or 0) + 1
+            if attempts < 3:
+                supabase_admin.table("campaign_jobs").update({
+                    "attempts": attempts,
+                    "scheduled_for": (datetime.utcnow() + timedelta(minutes=10)).isoformat(),
+                    "last_error": str(e)
+                }).eq("id", job["id"]).execute()
+            else:
+                supabase_admin.table("campaign_jobs").update({
+                    "status": "failed", "attempts": attempts, "last_error": str(e)
+                }).eq("id", job["id"]).execute()
+                failed += 1
+            logger.error(f"Campaign job {job['id']} failed (attempt {attempts}): {str(e)}")
+        processed += 1
+
+    # Mark any fully-drained campaigns as completed
+    for campaign_id in touched_campaigns:
+        remaining = supabase_admin.table("campaign_jobs").select("id", count="exact").eq(
+            "campaign_id", campaign_id
+        ).eq("status", "pending").execute()
+        if (remaining.count or 0) == 0:
+            sent_total = supabase_admin.table("campaign_jobs").select("id", count="exact").eq(
+                "campaign_id", campaign_id
+            ).eq("status", "sent").execute()
+            supabase_admin.table("campaigns").update({
+                "status": "completed",
+                "sent_count": sent_total.count or 0,
+                "completed_at": datetime.utcnow().isoformat()
+            }).eq("id", campaign_id).execute()
+
+    return {"message": f"Processed {processed} jobs.", "processed": processed, "sent": sent_ok, "failed": failed}
 
 async def send_bulk_via_gmail(
     campaign: dict,
@@ -3186,6 +3489,13 @@ async def send_bulk_via_gmail(
     gmail_accounts: list,
     user_id: str
 ):
+    # RETIRED - replaced by the campaign_jobs queue + POST /process-campaigns.
+    # This function is no longer called anywhere; kept only for reference since it
+    # contains the working personalization/pixel/reply-to logic the new processor
+    # is based on. The problem with this version: it's one long-running loop that
+    # dies entirely if the host restarts or sleeps mid-campaign, losing all progress
+    # for contacts not yet reached. The queue-based replacement processes contacts
+    # as small, independently-recoverable jobs instead.
     import asyncio
     import random
     account_idx = 0
