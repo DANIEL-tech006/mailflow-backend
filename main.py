@@ -2606,6 +2606,25 @@ async def google_callback(code: str, state: str):
         expires_at = (datetime.utcnow() + timedelta(seconds=expires_in)).isoformat()
 
         try:
+            # Block the same Gmail address being actively connected to a DIFFERENT
+            # MailFlows account at the same time. Gmail's real 500/day sending cap
+            # applies to the Gmail account itself, not per MailFlows user - if two
+            # different MailFlows accounts both send from the same Gmail address,
+            # their combined real usage could exceed Gmail's actual limit without
+            # either account's own tracked "sent_today" counter ever reflecting it,
+            # risking Google flagging/suspending that Gmail account for both users.
+            other_user_conflict = supabase_admin.table("gmail_accounts").select("user_id").eq(
+                "gmail_address", gmail_address
+            ).eq("is_active", True).neq("user_id", user_id).execute()
+            if other_user_conflict.data:
+                from urllib.parse import quote
+                return RedirectResponse(
+                    url=FRONTEND_URL + "?gmail_error=already_connected_elsewhere&gmail_error_detail=" + quote(
+                        f"{gmail_address} is already actively connected to a different MailFlows account. "
+                        "Disconnect it there first, or use a different Gmail account here."
+                    )
+                )
+
             # Check if already exists
             existing = supabase_admin.table("gmail_accounts").select("id, is_active").eq(
                 "user_id", user_id
