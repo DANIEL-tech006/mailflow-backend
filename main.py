@@ -2266,7 +2266,7 @@ async def paystack_webhook(request: Request):
     body = await request.body()
     signature = request.headers.get("x-paystack-signature", "")
     expected = hmac.new(secret_key.encode(), body, hashlib.sha512).hexdigest()
-    if signature != expected:
+    if not hmac.compare_digest(signature, expected):
         return {"status": "ok"}
     try:
         event = json.loads(body)
@@ -2652,6 +2652,12 @@ async def google_callback(code: str, state: str):
                     "token_expires_at": expires_at,
                     "is_active": True,
                     "display_name": display_name,
+                    # Always reset this on reconnect. Without it, an account that was
+                    # previously hidden-from-view or "deleted" (see the /hide endpoint below)
+                    # stayed invisible in the UI and absent from Quick Send's dropdown even
+                    # after a genuinely successful OAuth reconnect - the token really did
+                    # save, it just never became visible again.
+                    "hidden_from_ui": False,
                 }).eq("user_id", user_id).eq("gmail_address", gmail_address).execute()
             else:
                 # Insert new
@@ -2697,20 +2703,31 @@ async def list_gmail_accounts(user=Depends(get_current_user)):
 
 @app.patch("/gmail/accounts/{account_id}/hide")
 async def hide_gmail_account(account_id: str, user=Depends(get_current_user)):
-    # Purely cosmetic - only removes a disconnected account from view. Does NOT
-    # affect the 10-hour reconnect cooldown, which still checks disconnected_at
-    # on ALL accounts regardless of this flag.
+    # This is what the frontend's "Delete" button calls. It's NOT a real row delete -
+    # deliberately. A true hard delete would erase disconnected_at, which would let
+    # someone disconnect+delete+reconnect to dodge the 10-hour reconnect cooldown and
+    # reset their daily send counter, silently letting real Gmail usage exceed the
+    # safe per-account cap without the system ever knowing (this exact abuse path is
+    # why disconnect is a soft-delete in the first place - see delete_gmail_account
+    # below). Instead, this wipes the actual sensitive/reusable data (tokens, display
+    # name) so the account can't be used to send and looks/feels genuinely gone in the
+    # UI, while keeping disconnected_at and gmail_address around purely as an internal
+    # abuse-prevention record. Reconnecting the same address later creates a fresh,
+    # fully-populated row via the OAuth callback's "update existing" path.
     existing = supabase_admin.table("gmail_accounts").select("is_active").eq(
         "id", account_id
     ).eq("user_id", user.id).single().execute()
     if not existing.data:
         raise HTTPException(status_code=404, detail="Account not found")
     if existing.data.get("is_active"):
-        raise HTTPException(status_code=400, detail="Disconnect this account first before deleting it from view")
-    supabase_admin.table("gmail_accounts").update({"hidden_from_ui": True}).eq(
-        "id", account_id
-    ).eq("user_id", user.id).execute()
-    return {"message": "Removed from view"}
+        raise HTTPException(status_code=400, detail="Disconnect this account first before deleting it")
+    supabase_admin.table("gmail_accounts").update({
+        "hidden_from_ui": True,
+        "access_token": None,
+        "refresh_token": None,
+        "display_name": None,
+    }).eq("id", account_id).eq("user_id", user.id).execute()
+    return {"message": "Gmail account deleted"}
 
 # ── Step 4: Delete Gmail account ──
 GMAIL_RECONNECT_COOLDOWN_HOURS = 10
