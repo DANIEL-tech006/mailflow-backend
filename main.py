@@ -758,7 +758,8 @@ async def delete_contact(contact_id: str, user=Depends(get_current_user)):
 import re as _re
 
 _vendor_health = {"reoon_fail_streak": 0, "reoon_alerted": False,
-                   "tavily_fail_streak": 0, "tavily_alerted": False}
+                   "tavily_fail_streak": 0, "tavily_alerted": False,
+                   "hunter_discover_fail_streak": 0, "hunter_discover_alerted": False}
 
 async def _note_vendor_result(vendor: str, ok: bool):
     """Tracks consecutive failures per external vendor (Reoon, Tavily). After a
@@ -1037,7 +1038,221 @@ async def extract_emails_from_page(client, url: str) -> set:
     except Exception:
         return set()
 
-async def scrape_company_websites(niche: str, limit: int) -> list:
+ROLE_BASED_EMAIL_PREFIXES = {
+    "support", "info", "contact", "hello", "sales", "admin", "office",
+    "help", "enquiries", "enquiry", "inquiries", "inquiry", "noreply",
+    "no-reply", "team", "general", "mail", "reservations", "booking",
+    "bookings", "orders", "customerservice", "customercare", "care",
+    "press", "media", "hr", "careers", "jobs", "billing", "accounts",
+    "webmaster", "postmaster", "marketing", "newsletter",
+}
+
+def is_role_based_email(email: str) -> bool:
+    """A shared department inbox (support@, info@, etc.) rather than a specific
+    person. These can be genuinely valid and deliverable, so email verification
+    would happily pass them - but they're the wrong kind of contact for cold
+    outreach (pitching a business to a support@ inbox isn't appropriate), so
+    they're filtered out before a result is ever shown to or charged to a user."""
+    local_part = (email or "").split("@")[0].strip().lower()
+    local_part = local_part.replace(".", "").replace("-", "").replace("_", "")
+    return local_part in ROLE_BASED_EMAIL_PREFIXES
+
+def normalize_search_key(niche: str) -> str:
+    """Collapses whitespace/casing so 'Restaurants  in Lagos' and 'restaurants in lagos'
+    hit the same cache entry."""
+    return " ".join((niche or "").strip().lower().split())
+
+async def check_search_cache(niche: str) -> list:
+    """Checks for previously-found results for this exact search before spending
+    any Tavily or Hunter credits. Cache entries never expire on their own (a real
+    business email doesn't usually change), but a search only ever counts as a
+    cache hit if it has at least one saved result - an empty search isn't cached,
+    since a niche/location combo that returned nothing today might return
+    something once more businesses are indexed later."""
+    key = normalize_search_key(niche)
+    if not key:
+        return []
+    try:
+        res = supabase_admin.table("search_cache").select(
+            "email, name, company, website, source"
+        ).eq("search_key", key).execute()
+        return res.data or []
+    except Exception as e:
+        logger.error("check_search_cache failed: " + str(e))
+        return []
+
+async def save_to_search_cache(niche: str, results: list):
+    """Saves real, usable (already role-filtered) results for reuse by future
+    identical searches from any user, so the same real API cost is never paid
+    twice for the same niche/location."""
+    key = normalize_search_key(niche)
+    if not key or not results:
+        return
+    rows = [{
+        "search_key": key,
+        "email": r["email"],
+        "name": r.get("name", ""),
+        "company": r.get("company", ""),
+        "website": r.get("website", ""),
+        "source": r.get("source", "unknown"),
+    } for r in results]
+    try:
+        supabase_admin.table("search_cache").upsert(
+            rows, on_conflict="search_key,email"
+        ).execute()
+    except Exception as e:
+        logger.error("save_to_search_cache failed: " + str(e))
+
+async def get_fallback_quota(user_id: str) -> dict:
+    """The Hunter Discover fallback (used only when Tavily finds nothing usable)
+    is capped at 10% of the plan's BASE scraper limit - deliberately separate from
+    scraper_used_this_month/scraper_bonus_credits, which stay Tavily-only and
+    completely untouched by this. Free plan gets no fallback access at all."""
+    plan_fallback_pct = {"free": 0.0, "personal": 0.10, "corporate": 0.10}
+    try:
+        profile = supabase_admin.table("users").select(
+            "plan, scraper_limit, fallback_used_this_month, fallback_reset_month"
+        ).eq("id", user_id).single().execute()
+        profile_data = profile.data
+    except Exception as e:
+        logger.error("get_fallback_quota query failed for user " + user_id + ": " + str(e))
+        profile_data = None
+
+    if not profile_data:
+        return {"limit": 0, "used": 0, "remaining": 0}
+
+    plan = (profile_data.get("plan") or "free").lower()
+    base_limit = profile_data.get("scraper_limit") or {"free": 4, "personal": 100, "corporate": 500}.get(plan, 4)
+    limit = int(base_limit * plan_fallback_pct.get(plan, 0.0))
+    used = profile_data.get("fallback_used_this_month") or 0
+
+    current_month = datetime.utcnow().strftime("%Y-%m")
+    if profile_data.get("fallback_reset_month") != current_month:
+        used = 0
+        try:
+            supabase_admin.table("users").update({
+                "fallback_used_this_month": 0,
+                "fallback_reset_month": current_month
+            }).eq("id", user_id).execute()
+        except Exception as e:
+            logger.error("get_fallback_quota reset update failed: " + str(e))
+
+    return {"limit": limit, "used": used, "remaining": max(limit - used, 0)}
+
+async def get_system_fallback_remaining() -> int:
+    """Hunter's free tier gives a fixed 50 credits/month for the WHOLE account,
+    shared with the existing Reoon->Hunter verification fallback. This is a
+    second, account-wide cap layered on top of each user's own 10% quota -
+    without it, a single user maxing out their personal quota could exhaust
+    Hunter's entire monthly pool by themselves, leaving zero for everyone else
+    even though their own quota said they still had some left. Whichever cap
+    (per-user or account-wide) is hit first wins."""
+    monthly_cap = int(os.getenv("HUNTER_FALLBACK_MONTHLY_CAP", "40"))
+    current_month = datetime.utcnow().strftime("%Y-%m")
+    try:
+        row = supabase_admin.table("system_counters").select(
+            "value, reset_month"
+        ).eq("key", "hunter_fallback_used").single().execute()
+        data = row.data
+    except Exception:
+        data = None
+
+    used = 0
+    if data:
+        if data.get("reset_month") != current_month:
+            used = 0
+            try:
+                supabase_admin.table("system_counters").update({
+                    "value": 0, "reset_month": current_month
+                }).eq("key", "hunter_fallback_used").execute()
+            except Exception as e:
+                logger.error("system_counters reset failed: " + str(e))
+        else:
+            used = data.get("value") or 0
+    else:
+        try:
+            supabase_admin.table("system_counters").insert({
+                "key": "hunter_fallback_used", "value": 0, "reset_month": current_month
+            }).execute()
+        except Exception as e:
+            logger.error("system_counters init failed: " + str(e))
+
+    return max(monthly_cap - used, 0)
+
+async def increment_system_fallback_usage(count: int):
+    if count <= 0:
+        return
+    try:
+        supabase_admin.rpc("increment_system_counter", {
+            "counter_key": "hunter_fallback_used", "amount": count
+        }).execute()
+    except Exception as e:
+        logger.error("increment_system_fallback_usage failed: " + str(e))
+
+async def call_hunter_discover_fallback(niche: str, limit: int) -> list:
+    """Fallback source, only ever called when Tavily returns zero usable results
+    for a search. Hunter's Discover endpoint finds companies matching a natural-
+    language query, then Domain Search pulls real emails from each company's
+    domain. Like Tavily, this is still fundamentally built from Hunter's own web
+    crawl of company sites - it's a different index/crawler than Tavily, so it
+    can genuinely catch companies Tavily's search missed, but it is NOT
+    guaranteed to find a business that has zero web presence anywhere."""
+    hunter_key = os.getenv("HUNTER_API_KEY")
+    if not hunter_key:
+        return []
+
+    results = []
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        try:
+            discover_res = await client.get(
+                "https://api.hunter.io/v2/discover",
+                params={"api_key": hunter_key, "query": niche, "limit": 5}
+            )
+            if discover_res.status_code != 200:
+                logger.error("Hunter Discover HTTP " + str(discover_res.status_code) + ": " + discover_res.text[:300])
+                await _note_vendor_result("hunter_discover", ok=False)
+                return []
+            companies = discover_res.json().get("data", [])
+            await _note_vendor_result("hunter_discover", ok=True)
+        except Exception as e:
+            logger.error("Hunter Discover call failed: " + str(e))
+            await _note_vendor_result("hunter_discover", ok=False)
+            return []
+
+        for c in companies:
+            domain = c.get("domain")
+            if not domain:
+                continue
+            try:
+                ds_res = await client.get(
+                    "https://api.hunter.io/v2/domain-search",
+                    params={"api_key": hunter_key, "domain": domain, "limit": 5}
+                )
+                if ds_res.status_code != 200:
+                    continue
+                emails = ds_res.json().get("data", {}).get("emails", [])
+            except Exception as e:
+                logger.error("Hunter Domain Search failed for " + domain + ": " + str(e))
+                continue
+
+            for e in emails:
+                email_addr = e.get("value")
+                if not email_addr or is_role_based_email(email_addr):
+                    continue
+                full_name = " ".join(filter(None, [e.get("first_name"), e.get("last_name")])).strip()
+                results.append({
+                    "name": full_name,
+                    "email": email_addr,
+                    "company": c.get("organization") or "",
+                    "website": "https://" + domain,
+                    "source": "hunter_discover",
+                })
+            if len(results) >= limit:
+                break
+
+    return results[:limit]
+
+
     """Finds business websites for a niche via Tavily's search API,
     then checks their own published contact pages for emails they've chosen to share."""
     tavily_key = os.getenv("TAVILY_API_KEY")
@@ -1104,24 +1319,67 @@ async def scrape_emails(data: ScrapeModel, user=Depends(get_current_user)):
             detail=f"Scraper limit reached ({quota['used']}/{quota['limit']} this month). Upgrade your plan to scrape more contacts."
         )
 
-    # Tavily itself bills per search query, but we charge users per email actually
-    # found and delivered (not per search) - see the charging logic below.
-    try:
-        results = await scrape_company_websites(data.niche, data.limit)
-    except Exception as e:
-        logger.error("Website scraper error: " + str(e))
-        results = []
+    # Step 1: cache - a previous identical search (from any user) may have already
+    # found real results. Free to check, no vendor call, no credit implications
+    # for the check itself.
+    cached = await check_search_cache(data.niche)
+    if cached:
+        unique = cached[:data.limit]
+        source_note = "cache"
+    else:
+        # Step 2: Tavily, as before - free to attempt, users are only ever charged
+        # for emails actually found and delivered, not per search.
+        try:
+            raw_results = await scrape_company_websites(data.niche, data.limit)
+        except Exception as e:
+            logger.error("Website scraper error: " + str(e))
+            raw_results = []
 
-    seen = set()
-    unique = []
-    for r in results:
-        if r["email"] not in seen:
+        seen = set()
+        unique = []
+        for r in raw_results:
+            if r["email"] in seen or is_role_based_email(r["email"]):
+                continue
             seen.add(r["email"])
             unique.append(r)
+        source_note = "tavily"
 
-    # One credit = one email address actually found and returned, not one search.
-    # A search that finds nothing costs nothing. Cap results to what the user can
-    # afford (monthly allowance first, then bonus top-up credits).
+        # Step 3: Tavily fallback - ONLY when Tavily found literally nothing usable
+        # (empty, or everything it found was a role-based inbox that got filtered
+        # out above). Two independent caps are checked, and whichever is smaller
+        # wins: this user's own 10%-of-plan monthly allowance, AND the whole
+        # account's shared Hunter free-tier pool for the month.
+        if not unique:
+            fallback_quota = await get_fallback_quota(user.id)
+            system_remaining = await get_system_fallback_remaining()
+            fallback_room = min(fallback_quota["remaining"], system_remaining)
+            if fallback_room > 0:
+                try:
+                    fallback_results = await call_hunter_discover_fallback(data.niche, min(data.limit, fallback_room))
+                except Exception as e:
+                    logger.error("Hunter fallback error: " + str(e))
+                    fallback_results = []
+                seen = set()
+                for r in fallback_results:
+                    if r["email"] not in seen:
+                        seen.add(r["email"])
+                        unique.append(r)
+                if unique:
+                    source_note = "hunter_fallback"
+                    fb_charge = len(unique)
+                    supabase_admin.table("users").update({
+                        "fallback_used_this_month": fallback_quota["used"] + fb_charge
+                    }).eq("id", user.id).execute()
+                    await increment_system_fallback_usage(fb_charge)
+
+        if unique:
+            await save_to_search_cache(data.niche, unique)
+
+    # One credit = one email address actually found and returned, not one search
+    # - this applies identically whether the result came from cache, Tavily, or
+    # the Hunter fallback. Cap results to what the user can afford (monthly
+    # allowance first, then bonus top-up credits, which are Tavily-sourced only
+    # and untouched by any of the above).
     monthly_remaining = max(quota["limit"] - quota["used"], 0)
     affordable = monthly_remaining + quota["bonus_credits"]
     if len(unique) > affordable:
@@ -1141,6 +1399,7 @@ async def scrape_emails(data: ScrapeModel, user=Depends(get_current_user)):
         "results": unique,
         "count": len(unique),
         "niche": data.niche,
+        "source": source_note,
         "scraper_used": new_used,
         "scraper_limit": quota["limit"],
         "bonus_credits_remaining": new_bonus
