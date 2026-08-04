@@ -1252,7 +1252,7 @@ async def call_hunter_discover_fallback(niche: str, limit: int) -> list:
 
     return results[:limit]
 
-
+async def scrape_company_websites(niche: str, limit: int) -> list:
     """Finds business websites for a niche via Tavily's search API,
     then checks their own published contact pages for emails they've chosen to share."""
     tavily_key = os.getenv("TAVILY_API_KEY")
