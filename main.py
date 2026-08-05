@@ -759,7 +759,8 @@ import re as _re
 
 _vendor_health = {"reoon_fail_streak": 0, "reoon_alerted": False,
                    "tavily_fail_streak": 0, "tavily_alerted": False,
-                   "hunter_discover_fail_streak": 0, "hunter_discover_alerted": False}
+                   "hunter_discover_fail_streak": 0, "hunter_discover_alerted": False,
+                   "snov_discover_fail_streak": 0, "snov_discover_alerted": False}
 
 async def _note_vendor_result(vendor: str, ok: bool):
     """Tracks consecutive failures per external vendor (Reoon, Tavily). After a
@@ -1252,6 +1253,156 @@ async def call_hunter_discover_fallback(niche: str, limit: int) -> list:
 
     return results[:limit]
 
+KNOWN_NIGERIAN_LOCATIONS = [
+    "lagos", "abuja", "owerri", "port harcourt", "enugu", "kano", "ibadan",
+    "kaduna", "benin city", "aba", "jos", "ilorin", "onitsha", "warri",
+    "calabar", "uyo", "abeokuta", "akure", "asaba", "umuahia", "awka",
+    "yenagoa", "makurdi", "minna", "sokoto", "maiduguri", "zaria",
+    "nigeria",
+]
+
+def parse_niche_for_snov(niche: str):
+    """Snov's Database Search needs separate industry and location filters, unlike
+    Tavily/Hunter which accept one free-text query. Real search phrases in this app
+    don't reliably use a consistent pattern (e.g. 'poultry in owerri' vs 'marketing
+    agencies lagos' vs 'tech startups nigeria' - no ' in ' separator in the last two),
+    so this uses a known-city/state name list rather than fragile NLP. Any niche
+    mentioning a recognized Nigerian location gets that split out; everything else is
+    passed through as an industry-only search with no location filter. This is a
+    heuristic, not a real parser - it will miss unlisted towns."""
+    text = (niche or "").strip().lower()
+    for loc in KNOWN_NIGERIAN_LOCATIONS:
+        if text.endswith(loc):
+            industry = text[: -len(loc)].strip()
+            return (industry or text, loc)
+    return (text, None)
+
+async def get_snov_access_token():
+    client_id = os.getenv("SNOV_CLIENT_ID")
+    client_secret = os.getenv("SNOV_CLIENT_SECRET")
+    if not client_id or not client_secret:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            res = await client.post("https://api.snov.io/v1/oauth/access_token", data={
+                "grant_type": "client_credentials",
+                "client_id": client_id,
+                "client_secret": client_secret,
+            })
+            if res.status_code != 200:
+                logger.error("Snov token request failed: HTTP " + str(res.status_code))
+                return None
+            return res.json().get("access_token")
+    except Exception as e:
+        logger.error("Snov token request error: " + str(e))
+        return None
+
+async def _poll_snov_result(client: httpx.AsyncClient, url: str, headers: dict, attempts: int = 6, delay: float = 2.0):
+    """Snov's Database Search is async: a POST starts the task, then the result has
+    to be polled until status='completed'. Gives up gracefully after ~12 seconds
+    rather than hanging the whole search request indefinitely."""
+    for _ in range(attempts):
+        res = await client.get(url, headers=headers)
+        if res.status_code != 200:
+            return None
+        body = res.json()
+        if body.get("status") == "completed":
+            return body
+        await asyncio.sleep(delay)
+    return None
+
+async def call_snov_discover_fallback(niche: str, limit: int) -> list:
+    """Alternate fallback provider (Database Search API) - real industry+location
+    discovery without needing a known domain, same category of capability as Hunter
+    Discover. Kept alongside the Hunter integration, never replacing it; which one
+    actually runs is controlled by the FALLBACK_PROVIDER env var so switching back
+    to Hunter later (e.g. once the 12-month bulk credit pack is purchased) is a
+    one-line Render env var change, not a code change."""
+    token = await get_snov_access_token()
+    if not token:
+        return []
+
+    industry, location = parse_niche_for_snov(niche)
+    headers = {"Authorization": "Bearer " + token}
+    filters = {"company": {}}
+    if industry:
+        filters["company"]["industries"] = {"include": [industry]}
+    if location:
+        filters["company"]["locations"] = {"include": [{"locality": location, "location_type": "city"}]}
+
+    results = []
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            start_res = await client.post(
+                "https://api.snov.io/v2/database-search/prospects/start",
+                headers=headers,
+                json={"filters": filters, "page": 1},
+            )
+            if start_res.status_code != 200:
+                logger.error("Snov database-search start HTTP " + str(start_res.status_code) + ": " + start_res.text[:300])
+                await _note_vendor_result("snov_discover", ok=False)
+                return []
+            task_hash = start_res.json().get("meta", {}).get("task_hash")
+            if not task_hash:
+                await _note_vendor_result("snov_discover", ok=False)
+                return []
+
+            result_body = await _poll_snov_result(
+                client,
+                "https://api.snov.io/v2/database-search/prospects/result/" + task_hash,
+                headers,
+            )
+            if not result_body:
+                await _note_vendor_result("snov_discover", ok=False)
+                return []
+            await _note_vendor_result("snov_discover", ok=True)
+
+            prospects = result_body.get("data", {}).get("prospects", []) or []
+            for p in prospects[: max(limit * 2, limit)]:
+                reveal_url = p.get("email_and_hidden_info_reveal")
+                if not reveal_url:
+                    continue
+                try:
+                    reveal_start = await client.post(reveal_url, headers=headers)
+                    if reveal_start.status_code != 200:
+                        continue
+                    reveal_task = reveal_start.json().get("meta", {}).get("task_hash")
+                    if not reveal_task:
+                        continue
+                    email_body = await _poll_snov_result(
+                        client,
+                        "https://api.snov.io/v2/database-search/prospects/search-emails/result/" + reveal_task,
+                        headers,
+                        attempts=4,
+                    )
+                    if not email_body:
+                        continue
+                    emails = email_body.get("data", {}).get("emails", []) or []
+                    for e in emails:
+                        email_addr = e.get("email")
+                        if not email_addr or is_role_based_email(email_addr):
+                            continue
+                        company = p.get("company", {}) or {}
+                        results.append({
+                            "name": " ".join(filter(None, [p.get("first_name"), p.get("last_name")])).strip(),
+                            "email": email_addr,
+                            "company": company.get("name", ""),
+                            "website": ("https://" + company["domain"]) if company.get("domain") else "",
+                            "source": "snov_discover",
+                        })
+                        break
+                except Exception as e:
+                    logger.error("Snov email reveal error: " + str(e))
+                    continue
+                if len(results) >= limit:
+                    break
+    except Exception as e:
+        logger.error("Snov fallback error: " + str(e))
+        await _note_vendor_result("snov_discover", ok=False)
+        return []
+
+    return results[:limit]
+
 async def scrape_company_websites(niche: str, limit: int) -> list:
     """Finds business websites for a niche via Tavily's search API,
     then checks their own published contact pages for emails they've chosen to share."""
@@ -1354,10 +1505,14 @@ async def scrape_emails(data: ScrapeModel, user=Depends(get_current_user)):
             system_remaining = await get_system_fallback_remaining()
             fallback_room = min(fallback_quota["remaining"], system_remaining)
             if fallback_room > 0:
+                provider = os.getenv("FALLBACK_PROVIDER", "hunter").strip().lower()
                 try:
-                    fallback_results = await call_hunter_discover_fallback(data.niche, min(data.limit, fallback_room))
+                    if provider == "snov":
+                        fallback_results = await call_snov_discover_fallback(data.niche, min(data.limit, fallback_room))
+                    else:
+                        fallback_results = await call_hunter_discover_fallback(data.niche, min(data.limit, fallback_room))
                 except Exception as e:
-                    logger.error("Hunter fallback error: " + str(e))
+                    logger.error(provider + " fallback error: " + str(e))
                     fallback_results = []
                 seen = set()
                 for r in fallback_results:
@@ -1365,7 +1520,7 @@ async def scrape_emails(data: ScrapeModel, user=Depends(get_current_user)):
                         seen.add(r["email"])
                         unique.append(r)
                 if unique:
-                    source_note = "hunter_fallback"
+                    source_note = provider + "_fallback"
                     fb_charge = len(unique)
                     supabase_admin.table("users").update({
                         "fallback_used_this_month": fallback_quota["used"] + fb_charge
