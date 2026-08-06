@@ -1040,7 +1040,7 @@ async def extract_emails_from_page(client, url: str) -> set:
         return set()
 
 ROLE_BASED_EMAIL_PREFIXES = {
-    "support", "contact", "hello", "sales", "admin", "office",
+    "support", "sales", "admin",
     "help", "enquiries", "enquiry", "inquiries", "inquiry", "noreply",
     "no-reply", "team", "general", "mail", "reservations", "booking",
     "bookings", "orders", "customerservice", "customercare", "care",
